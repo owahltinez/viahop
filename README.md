@@ -13,13 +13,19 @@ Fast, standalone, zero-dependency, MIT-licensed headless Specctra DSN/SES multi-
 - **Pull-tight & via-reduction optimizer**: spatially indexed multi-segment octilinear shortcutting, inter-via layer flattening (via-pair elimination), collinear merging, redundant via removal, and dangling stub pruning gated by exact continuous DRC.
 - **Full KiCad 10 Specctra DSN/SES + POFV BGA fanout**: handles `um`/`mil`/`mm` resolutions, signal vs power layers, `(plane ...)` zones, board boundary polygons, structure and image keepouts, front/back placement mirroring and rotation, fixed wires/vias, per-class clearances, and centered POFV via-in-pad fanout for dense `0.40 mm` / `0.50 mm` BGAs.
 
-## Build & Test
+## Install & Build
 
 ```bash
+# Install from crates.io
+cargo install viahop
+
+# Or build from source
 cargo build --release
 cargo test
 cargo clippy --all-targets -- -D warnings
 ```
+
+Prebuilt CLI binaries, shared libraries (`libviahop.{so,dylib,dll}`), and `include/viahop.h` are also available on [GitHub Releases](https://github.com/owahltinez/viahop/releases).
 
 Outputs:
 - CLI binary: `target/release/viahop`
