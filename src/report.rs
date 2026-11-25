@@ -2,10 +2,14 @@
 
 use std::fmt::Write;
 
+use crate::astar::{astar_connect, PassParams, SearchScratch};
 use crate::board::{Board, NetRoute};
+use crate::connectivity::connected_component_clusters;
 use crate::drc::check_drc;
+use crate::fanout::analyze_fanout;
 use crate::geometry::Point;
-use crate::router::{diagnose_unrouted_pairs, RouteStats};
+use crate::grid::RoutingGrid;
+use crate::router::{build_mst, build_net_components, RouteStats, Terminal};
 
 /// Classification of why an unconnected net pair failed to route.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,6 +134,145 @@ impl RouteReport {
         let _ = writeln!(out, "  ]");
         let _ = write!(out, "}}");
         out
+    }
+}
+
+fn diagnose_unrouted_pairs(
+    board: &Board,
+    routes: &[NetRoute],
+    diagnose: bool,
+) -> Vec<UnroutedConnection> {
+    let fanout = analyze_fanout(board);
+    let grid = RoutingGrid::build(board, &fanout, 1);
+    let n2d = grid.n2d();
+    let mut scratch = SearchScratch::new(grid.sig_layers.len() * n2d);
+    let mut out = Vec::new();
+
+    for net in &board.nets {
+        if net.ignored || net.pad_ids.len() < 2 {
+            continue;
+        }
+        let components = build_net_components(board, &grid, &fanout, net.id);
+        if components.len() < 2 {
+            continue;
+        }
+        let nr = routes.get(net.id).cloned().unwrap_or_else(|| NetRoute {
+            net_id: net.id,
+            ..Default::default()
+        });
+        let clusters = connected_component_clusters(board, &components, &nr);
+        if clusters.len() <= 1 {
+            continue;
+        }
+
+        let cluster_terms: Vec<Vec<Terminal>> = clusters
+            .iter()
+            .map(|cids| {
+                cids.iter()
+                    .flat_map(|&cid| components[cid].iter().cloned())
+                    .collect()
+            })
+            .collect();
+        let mst_edges = build_mst(&cluster_terms);
+        let rules = &net.rules;
+        let min_via_dist = (2.0 * rules.via_radius + rules.via_via).max(rules.via_drill + 205.0);
+
+        for (ca, cb) in mst_edges {
+            let (ta, tb) = closest_terminals(&cluster_terms[ca], &cluster_terms[cb]);
+            let (diagnosis, reason) = if diagnose {
+                let src = cluster_anchors(&cluster_terms[ca], n2d, grid.cols);
+                let dst = cluster_anchors(&cluster_terms[cb], n2d, grid.cols);
+                if src.is_empty() || dst.is_empty() {
+                    (
+                        Some(UnroutedKind::Blocked),
+                        Some("no_legal_terminal_entry".to_string()),
+                    )
+                } else {
+                    let params = PassParams {
+                        present_factor: 1.0,
+                        h_weight: 1.15,
+                        strict_mode: true,
+                        max_expansions: 1_200_000,
+                    };
+                    let solo = astar_connect(
+                        &grid,
+                        net.id,
+                        &src,
+                        &[],
+                        &dst,
+                        &[],
+                        &[],
+                        min_via_dist,
+                        &params,
+                        &mut scratch,
+                    );
+                    if solo.is_some() {
+                        (
+                            Some(UnroutedKind::Congestion),
+                            Some("routable_alone_blocked_by_other_nets".to_string()),
+                        )
+                    } else {
+                        (
+                            Some(UnroutedKind::Blocked),
+                            Some("static_obstacle_or_rule_blockage".to_string()),
+                        )
+                    }
+                }
+            } else {
+                (None, None)
+            };
+
+            out.push(UnroutedConnection {
+                net: net.name.clone(),
+                class_name: net.class_name.clone(),
+                from_pin: terminal_label(board, ta),
+                from_pos: ta.exact,
+                to_pin: terminal_label(board, tb),
+                to_pos: tb.exact,
+                diagnosis,
+                reason,
+            });
+        }
+    }
+
+    out
+}
+
+fn cluster_anchors(
+    terms: &[Terminal],
+    n2d: usize,
+    cols: usize,
+) -> Vec<(u32, Point, Option<Point>, usize)> {
+    let mut out = Vec::new();
+    for t in terms {
+        for &(sl, gx, gy, via_opt, pad_bl) in &t.entries {
+            out.push(((sl * n2d + gy * cols + gx) as u32, t.exact, via_opt, pad_bl));
+        }
+    }
+    out
+}
+
+fn closest_terminals<'a>(a: &'a [Terminal], b: &'a [Terminal]) -> (&'a Terminal, &'a Terminal) {
+    let mut best = (&a[0], &b[0]);
+    let mut best_d = f64::INFINITY;
+    for ta in a {
+        for tb in b {
+            let d = ta.exact.dist(tb.exact);
+            if d < best_d {
+                best_d = d;
+                best = (ta, tb);
+            }
+        }
+    }
+    best
+}
+
+fn terminal_label(board: &Board, t: &Terminal) -> String {
+    if let Some(pid) = t.pad_id {
+        let p = &board.pads[pid];
+        format!("{}-{}", p.refdes, p.pin_name)
+    } else {
+        format!("fixed@({:.0},{:.0})", t.exact.x, t.exact.y)
     }
 }
 

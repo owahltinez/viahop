@@ -99,8 +99,8 @@ fn parse_args(args: &[String]) -> Result<Action, String> {
         match flag {
             "-h" | "--help" => return Ok(Action::Help),
             "-V" | "--version" => return Ok(Action::Version),
-            "-de" | "--input" => input_dsn = Some(next_val(&mut i, flag, inline_val)?),
-            "-do" | "--output" => output_ses = Some(next_val(&mut i, flag, inline_val)?),
+            "-i" | "-de" | "--input" => input_dsn = Some(next_val(&mut i, flag, inline_val)?),
+            "-o" | "-do" | "--output" => output_ses = Some(next_val(&mut i, flag, inline_val)?),
             "-dr" | "--rules" => rules_file = Some(next_val(&mut i, flag, inline_val)?),
             "--initial-session" => initial_session = Some(next_val(&mut i, flag, inline_val)?),
             "--report" => report_file = Some(next_val(&mut i, flag, inline_val)?),
@@ -118,7 +118,7 @@ fn parse_args(args: &[String]) -> Result<Action, String> {
                     .map_err(|_| format!("invalid integer for {flag}: {v}"))?
                     .max(1);
             }
-            "-inc" | "--ignore-net-classes" => {
+            "-inc" | "--ignore" | "--ignore-net-classes" => {
                 let v = next_val(&mut i, flag, inline_val)?;
                 for item in v.split(',') {
                     let trimmed = item.trim();
@@ -134,7 +134,7 @@ fn parse_args(args: &[String]) -> Result<Action, String> {
                     .map_err(|_| format!("invalid integer for {flag}: {v}"))?
                     .max(1);
             }
-            "-dl" | "--disable-log" => disable_log = true,
+            "-q" | "-dl" | "--quiet" | "--disable-log" => disable_log = true,
             "--via-at-smd" => via_at_smd = Some(true),
             "--no-via-at-smd" => via_at_smd = Some(false),
             "--timeout" | "--max-time" => {
@@ -258,21 +258,20 @@ fn write_atomic(path: &str, contents: &str) -> std::io::Result<()> {
 fn print_help() {
     println!(
         "viahop {} - Fast, standalone, zero-dependency Specctra DSN/SES PCB autorouter\n\n\
-USAGE:\n  viahop -de <INPUT.dsn> -do <OUTPUT.ses> [OPTIONS]\n\n\
+USAGE:\n  viahop -i <INPUT.dsn> -o <OUTPUT.ses> [OPTIONS]\n\n\
 OPTIONS:\n  \
-  -de, --input <FILE>          Input Specctra DSN file\n  \
-  -do, --output <FILE>         Output Specctra SES file (checkpointed on improvement)\n  \
-  -mp, --max-passes <N>        Max rip-up-and-reroute passes per start (default: 20)\n  \
+  -i, --input <FILE>           Input Specctra DSN file (alias: -de)\n  \
+  -o, --output <FILE>          Output Specctra SES file, checkpointed on improvement (alias: -do)\n  \
+  --max-passes <N>             Max rip-up-and-reroute passes per start, default 20 (alias: -mp)\n  \
   --multi-start <N>            Parallel shuffled starts if unrouted remain (default: 4)\n  \
   --initial-session <FILE>     Resume routing/optimization from an existing SES file\n  \
   --report <FILE>              Write detailed JSON report (stats, unrouted, violations)\n  \
   --diagnose                   With --report, classify unrouted pairs (congestion vs blocked)\n  \
-  -inc <LIST>                  Comma-separated ignored net classes or net names\n  \
-  -mt, --threads <N>           Worker threads (default: 1)\n  \
-  -dr, --rules <FILE>          Optional Specctra rules file\n  \
-  -dl, --disable-log           Suppress summary log on stderr\n  \
-  --via-at-smd                 Enable POFV (via-in-pad) on SMD pads\n  \
-  --no-via-at-smd              Disable POFV (via-in-pad) on SMD pads\n  \
+  --ignore <LIST>              Comma-separated ignored net classes or nets (alias: -inc)\n  \
+  --threads <N>                Worker threads, default 1 (alias: -mt)\n  \
+  --rules <FILE>               Optional Specctra rules file (alias: -dr)\n  \
+  -q, --quiet                  Suppress stderr summary (alias: -dl)\n  \
+  --via-at-smd / --no-via-at-smd  Override DSN POFV (via-in-pad) setting\n  \
   --timeout, --max-time <SECS> Soft timeout in seconds (writes best board so far)\n  \
   --json-summary               Print JSON routing summary to stdout\n  \
   -h, --help                   Show this help message\n  \

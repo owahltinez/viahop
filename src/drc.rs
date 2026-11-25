@@ -50,11 +50,20 @@ pub fn check_drc(board: &Board, routes: &[NetRoute]) -> DrcReport {
     }
 
     let mut buf = Vec::new();
+    let mut static_buf = Vec::new();
 
     // 1. Check routed segments against static obstacles & other routed segments.
     for (idx, &(net_a, seg, bb)) in all_segs.iter().enumerate() {
         let half_w = seg.width * 0.5;
-        if !board.check_segment_static(net_a, seg.layer, seg.a, seg.b, seg.width, -0.5) {
+        if !board.check_segment_static_with_buf(
+            net_a,
+            seg.layer,
+            seg.a,
+            seg.b,
+            seg.width,
+            -0.5,
+            &mut static_buf,
+        ) {
             report.conflicting_nets.insert(net_a);
             report.violations.push(DrcViolation {
                 net_a,
@@ -99,7 +108,7 @@ pub fn check_drc(board: &Board, routes: &[NetRoute]) -> DrcReport {
 
     // 2. Check routed vias against static obstacles, other routed vias, and other routed segments.
     for (idx, &(net_a, via, bb)) in all_vias.iter().enumerate() {
-        if !board.check_via_static(net_a, via.pos, -0.5) {
+        if !board.check_via_static_with_buf(net_a, via.pos, -0.5, &mut static_buf) {
             report.conflicting_nets.insert(net_a);
             report.violations.push(DrcViolation {
                 net_a,

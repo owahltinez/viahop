@@ -33,6 +33,7 @@ pub fn analyze_fanout(board: &Board) -> FanoutPlan {
         pofv_capable_count: 0,
     };
     let mut neighbors = Vec::new();
+    let mut sbuf = Vec::new();
 
     for pad in &board.pads {
         let mut info = PadFanout {
@@ -111,12 +112,13 @@ pub fn analyze_fanout(board: &Board) -> FanoutPlan {
             plan.dense_bga_count += 1;
         }
 
-        if board.via_at_smd && board.check_via_static(net_id, pad.center, 0.0) {
+        if board.via_at_smd && board.check_via_static_with_buf(net_id, pad.center, 0.0, &mut sbuf) {
             info.pofv_allowed = true;
             plan.pofv_capable_count += 1;
         } else if info.is_dense_bga {
             // Try 45-degree dogbone escape offsets around the pad if POFV is off or blocked.
-            info.dogbone_via = find_dogbone_via(board, pad, net_id, pad_layer, min_center_dist);
+            info.dogbone_via =
+                find_dogbone_via(board, pad, net_id, pad_layer, min_center_dist, &mut sbuf);
         }
 
         plan.pads.push(info);
@@ -131,6 +133,7 @@ fn find_dogbone_via(
     net_id: usize,
     layer: usize,
     pitch: f64,
+    sbuf: &mut Vec<usize>,
 ) -> Option<Point> {
     let rules = &board.nets[net_id].rules;
     let offset = if pitch.is_finite() && pitch > 100.0 {
@@ -150,8 +153,16 @@ fn find_dogbone_via(
     ];
     for (dx, dy) in dirs {
         let cand = Point::new(pad.center.x + dx * offset, pad.center.y + dy * offset);
-        if board.check_via_static(net_id, cand, 0.0)
-            && board.check_segment_static(net_id, layer, pad.center, cand, rules.width, 0.0)
+        if board.check_via_static_with_buf(net_id, cand, 0.0, sbuf)
+            && board.check_segment_static_with_buf(
+                net_id,
+                layer,
+                pad.center,
+                cand,
+                rules.width,
+                0.0,
+                sbuf,
+            )
         {
             return Some(cand);
         }

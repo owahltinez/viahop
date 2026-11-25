@@ -28,28 +28,28 @@ Outputs:
 ## CLI Usage
 
 ```bash
-# Standard Freerouting-compatible invocation
-viahop -de board.dsn -do board.ses -mp 25 -inc GND,AGND --via-at-smd -mt 4
+# Clean CLI (also accepts Freerouting flags: -de, -do, -mp, -inc, -mt, -dr, -dl)
+viahop -i board.dsn -o board.ses --max-passes 25 --ignore GND,AGND --via-at-smd --threads 4
 
 # Parallel multi-start with diagnostic report and time cap
-viahop -de board.dsn -do board.ses -mt 4 --multi-start=4 --max-time=60 --report report.json --diagnose
+viahop -i board.dsn -o board.ses --threads 4 --multi-start=4 --max-time=60 --report report.json --diagnose
 
 # Resume and optimize from an existing session checkpoint
-viahop -de board.dsn -do board_opt.ses --initial-session board.ses -mp 10
+viahop -i board.dsn -o board_opt.ses --initial-session board.ses --max-passes 10
 ```
 
 Flags:
-- `-de`, `--input <FILE>`: input Specctra DSN
-- `-do`, `--output <FILE>`: output Specctra SES (atomically checkpointed on improvement)
-- `-mp`, `--max-passes <N>`: max rip-up-and-reroute passes per start (default `20`)
+- `-i`, `--input <FILE>` (alias: `-de`): input Specctra DSN
+- `-o`, `--output <FILE>` (alias: `-do`): output Specctra SES (atomically checkpointed on improvement)
+- `--max-passes <N>` (alias: `-mp`): max rip-up-and-reroute passes per start (default `20`)
 - `--multi-start <N>`: parallel shuffled starts if unrouted pairs or DRC issues remain (default `4`)
 - `--initial-session <FILE>`: resume routing/optimization from an existing `.ses` file
 - `--report <FILE>`: write detailed JSON report (stats, unrouted pairs, DRC violations)
 - `--diagnose`: with `--report`, classify unrouted pairs as `congestion` vs `blocked`
-- `-inc <LIST>`: comma-separated ignored net classes or net names
-- `-mt`, `--threads <N>`: worker threads (default `1`)
-- `-dr`, `--rules <FILE>`: optional Specctra rules file
-- `-dl`, `--disable-log`: suppress stderr summary
+- `--ignore <LIST>` (aliases: `-inc`, `--ignore-net-classes`): comma-separated ignored net classes or net names
+- `--threads <N>` (alias: `-mt`): worker threads (default `1`)
+- `--rules <FILE>` (alias: `-dr`): optional Specctra rules file
+- `-q`, `--quiet` (aliases: `-dl`, `--disable-log`): suppress stderr summary
 - `--via-at-smd` / `--no-via-at-smd`: override DSN POFV via-in-pad setting
 - `--timeout`, `--max-time <SECS>`: soft timeout in seconds
 - `--json-summary`: emit JSON metrics to stdout

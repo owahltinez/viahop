@@ -1,5 +1,6 @@
 //! `viahop`: Fast, standalone, zero-dependency headless Specctra DSN/SES multi-layer PCB autorouter.
 
+pub(crate) mod astar;
 pub mod board;
 pub mod connectivity;
 pub mod drc;

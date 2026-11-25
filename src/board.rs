@@ -166,6 +166,10 @@ impl SpatialGrid {
     pub fn query(&self, bbox: BBox, out: &mut Vec<usize>) {
         out.clear();
         let (x0, y0, x1, y1) = self.cell_range(bbox);
+        if x0 == x1 && y0 == y1 {
+            out.extend_from_slice(&self.buckets[y0 * self.cols + x0]);
+            return;
+        }
         for cy in y0..=y1 {
             let row = cy * self.cols;
             for cx in x0..=x1 {
@@ -547,10 +551,20 @@ impl Board {
         point_to_polygon_edge_dist(p, &self.boundary) >= margin
     }
 
-    /// Checks whether a via for `net_id` at `pos` clears all static obstacles
-    /// (other-net pads, keepouts, fixed wires, fixed vias, and board boundary).
-    /// Same-net pad overlap is explicitly allowed (essential for POFV).
+    /// Checks whether a via for `net_id` at `pos` clears all static obstacles.
     pub fn check_via_static(&self, net_id: usize, pos: Point, margin_extra: f64) -> bool {
+        let mut buf = Vec::new();
+        self.check_via_static_with_buf(net_id, pos, margin_extra, &mut buf)
+    }
+
+    /// Allocation-free variant of `check_via_static` reusing `buf` across spatial queries.
+    pub fn check_via_static_with_buf(
+        &self,
+        net_id: usize,
+        pos: Point,
+        margin_extra: f64,
+        buf: &mut Vec<usize>,
+    ) -> bool {
         let rules = &self.nets[net_id].rules;
         let r = rules.via_radius;
         if !self.is_inside_boundary(pos, r + margin_extra) {
@@ -558,11 +572,10 @@ impl Board {
         }
         let max_clr = rules.via_via.max(rules.via_smd).max(rules.via_wire) + margin_extra;
         let qbox = BBox::from_point(pos, r + max_clr + 50.0);
-        let mut buf = Vec::new();
 
         // Keepouts (structure cutouts need extra margin for curved Edge.Cuts clearance).
-        self.keepout_index.query(qbox.expand(160.0), &mut buf);
-        for &kid in &buf {
+        self.keepout_index.query(qbox.expand(160.0), buf);
+        for &kid in buf.iter() {
             let k = &self.keepouts[kid];
             if k.kind == KeepoutKind::Wire {
                 continue;
@@ -581,8 +594,8 @@ impl Board {
         }
 
         // Other-net pads
-        self.pad_index.query(qbox, &mut buf);
-        for &pid in &buf {
+        self.pad_index.query(qbox, buf);
+        for &pid in buf.iter() {
             let pad = &self.pads[pid];
             if pad.net_id == Some(net_id) {
                 continue;
@@ -599,12 +612,11 @@ impl Board {
         }
 
         // Fixed vias (check both other-net copper clearance and same-net drill hole-to-hole).
-        self.fixed_via_index.query(qbox.expand(120.0), &mut buf);
-        for &vid in &buf {
+        self.fixed_via_index.query(qbox.expand(120.0), buf);
+        for &vid in buf.iter() {
             let fv = &self.fixed_vias[vid];
             let center_dist = pos.dist(fv.pos);
             if fv.net_id == Some(net_id) {
-                // Exact overlap (<5um) reuses the fixed via; distinct drills must respect hole-to-hole.
                 if center_dist >= 5.0 {
                     let min_hole_c2c = (rules.via_drill + fv.drill) * 0.5 + 205.0 + margin_extra;
                     if center_dist < min_hole_c2c - 1e-4 {
@@ -624,8 +636,8 @@ impl Board {
         }
 
         // Fixed wires
-        self.fixed_seg_index.query(qbox, &mut buf);
-        for &sid in &buf {
+        self.fixed_seg_index.query(qbox, buf);
+        for &sid in buf.iter() {
             let fs = &self.fixed_segments[sid];
             if fs.net_id == Some(net_id) || !rules.via_layers.contains(&fs.layer) {
                 continue;
@@ -654,6 +666,22 @@ impl Board {
         width: f64,
         margin_extra: f64,
     ) -> bool {
+        let mut buf = Vec::new();
+        self.check_segment_static_with_buf(net_id, layer, a, b, width, margin_extra, &mut buf)
+    }
+
+    /// Allocation-free variant of `check_segment_static` reusing `buf` across spatial queries.
+    #[allow(clippy::too_many_arguments)]
+    pub fn check_segment_static_with_buf(
+        &self,
+        net_id: usize,
+        layer: usize,
+        a: Point,
+        b: Point,
+        width: f64,
+        margin_extra: f64,
+        buf: &mut Vec<usize>,
+    ) -> bool {
         let rules = &self.nets[net_id].rules;
         let half_w = width * 0.5;
         if self.boundary.len() >= 3 {
@@ -661,7 +689,6 @@ impl Board {
                 return false;
             }
             if segment_to_polygon_dist(a, b, &self.boundary) < half_w + margin_extra {
-                // Allow segments that are completely inside the boundary polygon (only check edge dist).
                 let da = point_to_polygon_edge_dist(a, &self.boundary);
                 let db = point_to_polygon_edge_dist(b, &self.boundary);
                 if da < half_w + margin_extra || db < half_w + margin_extra {
@@ -671,11 +698,10 @@ impl Board {
         }
         let max_clr = rules.clearance.max(rules.via_wire) + margin_extra;
         let qbox = BBox::from_points(&[a, b], half_w + max_clr + 50.0);
-        let mut buf = Vec::new();
 
         // Keepouts (structure cutouts carry extra margin for curved Edge.Cuts clearance).
-        self.keepout_index.query(qbox.expand(160.0), &mut buf);
-        for &kid in &buf {
+        self.keepout_index.query(qbox.expand(160.0), buf);
+        for &kid in buf.iter() {
             let k = &self.keepouts[kid];
             if k.kind == KeepoutKind::Via || !k.applies_to_layer(layer) {
                 continue;
@@ -691,8 +717,8 @@ impl Board {
         }
 
         // Other-net pads
-        self.pad_index.query(qbox, &mut buf);
-        for &pid in &buf {
+        self.pad_index.query(qbox, buf);
+        for &pid in buf.iter() {
             let pad = &self.pads[pid];
             if pad.net_id == Some(net_id) {
                 continue;
@@ -706,8 +732,8 @@ impl Board {
         }
 
         // Fixed vias
-        self.fixed_via_index.query(qbox, &mut buf);
-        for &vid in &buf {
+        self.fixed_via_index.query(qbox, buf);
+        for &vid in buf.iter() {
             let fv = &self.fixed_vias[vid];
             if fv.net_id == Some(net_id) || !fv.layers.contains(&layer) {
                 continue;
@@ -723,8 +749,8 @@ impl Board {
         }
 
         // Fixed wires
-        self.fixed_seg_index.query(qbox, &mut buf);
-        for &sid in &buf {
+        self.fixed_seg_index.query(qbox, buf);
+        for &sid in buf.iter() {
             let fs = &self.fixed_segments[sid];
             if fs.net_id == Some(net_id) || fs.layer != layer {
                 continue;

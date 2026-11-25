@@ -167,10 +167,38 @@ fn write_via_padstack(
     let _ = writeln!(out, "      )");
 }
 
-/// Joins contiguous segments on the same layer & width into compact polylines.
+/// Joins contiguous segments on the same layer & width into compact polylines in O(N) time.
 fn chain_segments(segments: &[RoutedSegment]) -> Vec<(usize, f64, Vec<Point>)> {
+    let pt_key = |p: Point| -> (i64, i64) {
+        ((p.x * 100.0).round() as i64, (p.y * 100.0).round() as i64)
+    };
+    let mut adj: HashMap<(usize, i64, i64), Vec<usize>> = HashMap::new();
+    for (i, s) in segments.iter().enumerate() {
+        let ka = pt_key(s.a);
+        let kb = pt_key(s.b);
+        adj.entry((s.layer, ka.0, ka.1)).or_default().push(i);
+        adj.entry((s.layer, kb.0, kb.1)).or_default().push(i);
+    }
+
     let mut out = Vec::new();
     let mut used = vec![false; segments.len()];
+    let find_next = |tip: Point, layer: usize, width: f64, used: &[bool]| -> Option<(usize, Point)> {
+        let tk = pt_key(tip);
+        let cands = adj.get(&(layer, tk.0, tk.1))?;
+        for &j in cands {
+            if used[j] || (segments[j].width - width).abs() > 0.1 {
+                continue;
+            }
+            if segments[j].a.dist_sq(tip) < 1e-4 {
+                return Some((j, segments[j].b));
+            }
+            if segments[j].b.dist_sq(tip) < 1e-4 {
+                return Some((j, segments[j].a));
+            }
+        }
+        None
+    };
+
     for i in 0..segments.len() {
         if used[i] {
             continue;
@@ -180,54 +208,22 @@ fn chain_segments(segments: &[RoutedSegment]) -> Vec<(usize, f64, Vec<Point>)> {
         let width = segments[i].width;
         let mut pts = vec![segments[i].a, segments[i].b];
 
-        // Extend forward from pts.last()
-        loop {
-            let tail = *pts.last().unwrap();
-            let mut found = None;
-            for j in 0..segments.len() {
-                if used[j] || segments[j].layer != layer || (segments[j].width - width).abs() > 0.1 {
-                    continue;
-                }
-                if segments[j].a.dist_sq(tail) < 1e-4 {
-                    found = Some((j, segments[j].b));
-                    break;
-                } else if segments[j].b.dist_sq(tail) < 1e-4 {
-                    found = Some((j, segments[j].a));
-                    break;
-                }
-            }
-            if let Some((j, next_pt)) = found {
-                used[j] = true;
-                pts.push(next_pt);
-            } else {
-                break;
-            }
+        while let Some((j, next_pt)) = find_next(*pts.last().unwrap(), layer, width, &used) {
+            used[j] = true;
+            pts.push(next_pt);
         }
-
-        // Extend backward from pts[0]
-        loop {
-            let head = pts[0];
-            let mut found = None;
-            for j in 0..segments.len() {
-                if used[j] || segments[j].layer != layer || (segments[j].width - width).abs() > 0.1 {
-                    continue;
-                }
-                if segments[j].b.dist_sq(head) < 1e-4 {
-                    found = Some((j, segments[j].a));
-                    break;
-                } else if segments[j].a.dist_sq(head) < 1e-4 {
-                    found = Some((j, segments[j].b));
-                    break;
-                }
-            }
-            if let Some((j, prev_pt)) = found {
-                used[j] = true;
-                pts.insert(0, prev_pt);
-            } else {
-                break;
-            }
+        let mut prefix = Vec::new();
+        let mut head = pts[0];
+        while let Some((j, prev_pt)) = find_next(head, layer, width, &used) {
+            used[j] = true;
+            prefix.push(prev_pt);
+            head = prev_pt;
         }
-
+        if !prefix.is_empty() {
+            prefix.reverse();
+            prefix.extend(pts);
+            pts = prefix;
+        }
         out.push((layer, width, pts));
     }
     out

@@ -85,12 +85,23 @@ pub(crate) fn connected_component_clusters(
     // 1. Segment-to-segment electrical contact on the same layer (handles T-junctions).
     for i in 0..ns {
         let sa = &nr.segments[i];
+        let ax0 = sa.a.x.min(sa.b.x);
+        let ax1 = sa.a.x.max(sa.b.x);
+        let ay0 = sa.a.y.min(sa.b.y);
+        let ay1 = sa.a.y.max(sa.b.y);
         for j in (i + 1)..ns {
             let sb = &nr.segments[j];
             if sa.layer != sb.layer {
                 continue;
             }
             let tol = (sa.width + sb.width) * 0.5 + 2.0;
+            if sb.a.x.max(sb.b.x) + tol < ax0
+                || sb.a.x.min(sb.b.x) - tol > ax1
+                || sb.a.y.max(sb.b.y) + tol < ay0
+                || sb.a.y.min(sb.b.y) - tol > ay1
+            {
+                continue;
+            }
             if segment_to_segment_dist(sa.a, sa.b, sb.a, sb.b) <= tol {
                 let ra = uf_find(&mut uf, seg_base + i);
                 let rb = uf_find(&mut uf, seg_base + j);

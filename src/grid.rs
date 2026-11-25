@@ -1,9 +1,14 @@
 //! Multi-layer routing grid, static obstacle rasterization, and PathFinder occupancy footprints.
 
+use std::sync::Arc;
+
 use crate::board::{Board, NetRoute};
 use crate::drc::DrcReport;
 use crate::fanout::FanoutPlan;
-use crate::geometry::{point_in_polygon, point_to_polygon_edge_dist, point_to_segment_dist, BBox, Point};
+use crate::geometry::{
+    point_in_polygon, point_to_polygon_edge_dist, point_to_segment_dist, point_to_segment_dist_sq,
+    BBox, Point,
+};
 
 pub const STATIC_OPEN: u32 = 0;
 pub const STATIC_BLOCKED: u32 = u32::MAX;
@@ -29,9 +34,9 @@ pub struct RoutingGrid {
     /// Maps board layer index -> signal-layer slot (0..num_sig), or None for power layers.
     pub board_to_sig: Vec<Option<usize>>,
     /// Per `(sl, cell2d)`: 0 = open, u32::MAX = blocked, net_id+1 = reserved for net_id.
-    pub static_wire: Vec<u32>,
+    pub static_wire: Arc<[u32]>,
     /// Per `cell2d`: 0 = open, u32::MAX = blocked, net_id+1 = reserved for net_id.
-    pub static_via: Vec<u32>,
+    pub static_via: Arc<[u32]>,
     pub wire_occ: Vec<u16>,
     pub wire_hist: Vec<f32>,
     pub via_occ: Vec<u16>,
@@ -118,20 +123,16 @@ impl RoutingGrid {
             }
         }
 
-        let mut grid = Self {
-            origin_x,
-            origin_y,
-            step,
-            cols,
-            rows,
-            sig_layers,
-            board_to_sig,
-            static_wire,
-            static_via,
-            wire_occ: vec![0; n3d],
-            wire_hist: vec![0.0; n3d],
-            via_occ: vec![0; n2d],
-            via_hist: vec![0.0; n2d],
+        let bbox_cells = |bb: BBox| -> (usize, usize, usize, usize) {
+            let gx0 = (((bb.min_x - origin_x) / step).floor() as isize)
+                .clamp(0, (cols - 1) as isize) as usize;
+            let gy0 = (((bb.min_y - origin_y) / step).floor() as isize)
+                .clamp(0, (rows - 1) as isize) as usize;
+            let gx1 = (((bb.max_x - origin_x) / step).ceil() as isize)
+                .clamp(0, (cols - 1) as isize) as usize;
+            let gy1 = (((bb.max_y - origin_y) / step).ceil() as isize)
+                .clamp(0, (rows - 1) as isize) as usize;
+            (gx0, gy0, gx1, gy1)
         };
 
         // 2. Rasterize keepouts (structure cutouts carry extra margin for curved Edge.Cuts clearance).
@@ -143,21 +144,21 @@ impl RoutingGrid {
             } else {
                 10.0
             };
-            let (x0, y0, x1, y1) = grid.bbox_cells(k.bbox.expand(def_via_r + k_margin + 30.0));
+            let (x0, y0, x1, y1) = bbox_cells(k.bbox.expand(def_via_r + k_margin + 30.0));
             for gy in y0..=y1 {
-                let y = grid.y_of(gy);
+                let y = origin_y + gy as f64 * step;
                 for gx in x0..=x1 {
-                    let p = Point::new(grid.x_of(gx), y);
+                    let p = Point::new(origin_x + gx as f64 * step, y);
                     let c2 = gy * cols + gx;
                     if block_wire && k.shape.dist_to_circle(p, def_half_w) < k_margin {
-                        for sl in 0..num_sig {
-                            if k.applies_to_layer(grid.sig_layers[sl]) {
-                                grid.static_wire[sl * n2d + c2] = STATIC_BLOCKED;
+                        for (sl, &bl) in sig_layers.iter().enumerate() {
+                            if k.applies_to_layer(bl) {
+                                static_wire[sl * n2d + c2] = STATIC_BLOCKED;
                             }
                         }
                     }
                     if block_via && k.shape.dist_to_circle(p, def_via_r) < k_margin {
-                        grid.static_via[c2] = STATIC_BLOCKED;
+                        static_via[c2] = STATIC_BLOCKED;
                     }
                 }
             }
@@ -177,19 +178,19 @@ impl RoutingGrid {
                     .map_or(def_via_via, |id| board.nets[id].rules.via_via.max(def_via_via))
             };
             let expand = def_via_r + via_clr.max(wire_clr) + def_half_w + 10.0;
-            let (x0, y0, x1, y1) = grid.bbox_cells(pad.bbox.expand(expand));
+            let (x0, y0, x1, y1) = bbox_cells(pad.bbox.expand(expand));
             let allow_pofv_here = pad.is_smd && board.via_at_smd && fanout.pads[pad.id].pofv_allowed;
 
             for gy in y0..=y1 {
-                let y = grid.y_of(gy);
+                let y = origin_y + gy as f64 * step;
                 for gx in x0..=x1 {
-                    let p = Point::new(grid.x_of(gx), y);
+                    let p = Point::new(origin_x + gx as f64 * step, y);
                     let c2 = gy * cols + gx;
                     let mut hits_via = false;
                     for &(bl, ref sh) in &pad.layer_shapes {
-                        if let Some(sl) = grid.board_to_sig[bl] {
+                        if let Some(sl) = board_to_sig[bl] {
                             if sh.dist_to_circle(p, def_half_w) < wire_clr {
-                                merge_owner(&mut grid.static_wire[sl * n2d + c2], owner);
+                                merge_owner(&mut static_wire[sl * n2d + c2], owner);
                             }
                         }
                         if !hits_via && sh.dist_to_circle(p, def_via_r) < via_clr {
@@ -202,7 +203,7 @@ impl RoutingGrid {
                         } else {
                             STATIC_BLOCKED
                         };
-                        merge_owner(&mut grid.static_via[c2], via_owner);
+                        merge_owner(&mut static_via[c2], via_owner);
                     }
                 }
             }
@@ -218,22 +219,22 @@ impl RoutingGrid {
                 .net_id
                 .map_or(def_via_wire, |id| board.nets[id].rules.via_wire.max(def_via_wire));
             let expand = def_via_r + v_clr.max(w_clr) + def_half_w + 10.0;
-            let (x0, y0, x1, y1) = grid.bbox_cells(fs.bbox.expand(expand));
-            let sig_opt = grid.board_to_sig[fs.layer];
+            let (x0, y0, x1, y1) = bbox_cells(fs.bbox.expand(expand));
+            let sig_opt = board_to_sig[fs.layer];
 
             for gy in y0..=y1 {
-                let y = grid.y_of(gy);
+                let y = origin_y + gy as f64 * step;
                 for gx in x0..=x1 {
-                    let p = Point::new(grid.x_of(gx), y);
+                    let p = Point::new(origin_x + gx as f64 * step, y);
                     let d = point_to_segment_dist(p, fs.a, fs.b) - fs.half_w;
                     let c2 = gy * cols + gx;
                     if let Some(sl) = sig_opt {
                         if d - def_half_w < w_clr {
-                            merge_owner(&mut grid.static_wire[sl * n2d + c2], owner);
+                            merge_owner(&mut static_wire[sl * n2d + c2], owner);
                         }
                     }
                     if d - def_via_r < v_clr {
-                        merge_owner(&mut grid.static_via[c2], owner);
+                        merge_owner(&mut static_via[c2], owner);
                     }
                 }
             }
@@ -252,37 +253,49 @@ impl RoutingGrid {
             let expand = (fv.radius + def_via_r + vv_clr.max(vw_clr))
                 .max(hole_c2c)
                 + 15.0;
-            let (x0, y0, x1, y1) = grid.bbox_cells(BBox::from_point(fv.pos, expand));
+            let (x0, y0, x1, y1) = bbox_cells(BBox::from_point(fv.pos, expand));
 
             for gy in y0..=y1 {
-                let y = grid.y_of(gy);
+                let y = origin_y + gy as f64 * step;
                 for gx in x0..=x1 {
-                    let p = Point::new(grid.x_of(gx), y);
+                    let p = Point::new(origin_x + gx as f64 * step, y);
                     let center_d = p.dist(fv.pos);
                     let d = center_d - fv.radius;
                     let c2 = gy * cols + gx;
                     if d - def_half_w < vw_clr {
-                        for sl in 0..num_sig {
-                            if fv.layers.contains(&grid.sig_layers[sl]) {
-                                merge_owner(&mut grid.static_wire[sl * n2d + c2], owner);
+                        for (sl, &bl) in sig_layers.iter().enumerate() {
+                            if fv.layers.contains(&bl) {
+                                merge_owner(&mut static_wire[sl * n2d + c2], owner);
                             }
                         }
                     }
                     if d - def_via_r < vv_clr || center_d < hole_c2c {
-                        // Exact center of a same-net fixed via is reusable without adding a new drill;
-                        // nearby non-coincident positions are blocked to avoid hole-to-hole collisions.
                         let via_owner = if center_d < 5.0 {
                             owner
                         } else {
                             STATIC_BLOCKED
                         };
-                        merge_owner(&mut grid.static_via[c2], via_owner);
+                        merge_owner(&mut static_via[c2], via_owner);
                     }
                 }
             }
         }
 
-        grid
+        Self {
+            origin_x,
+            origin_y,
+            step,
+            cols,
+            rows,
+            sig_layers,
+            board_to_sig,
+            static_wire: Arc::from(static_wire),
+            static_via: Arc::from(static_via),
+            wire_occ: vec![0; n3d],
+            wire_hist: vec![0.0; n3d],
+            via_occ: vec![0; n2d],
+            via_hist: vec![0.0; n2d],
+        }
     }
 
     #[inline]
@@ -349,6 +362,11 @@ impl RoutingGrid {
         let n2d = self.n2d();
         let num_sig = self.sig_layers.len();
 
+        let wire_r_sq = wire_r * wire_r;
+        let via_wire_r_sq = via_wire_r * via_wire_r;
+        let via_via_r_sq = via_via_r * via_via_r;
+        let center_r_sq = (self.step * 0.55) * (self.step * 0.55);
+
         let mut wire_halo = Vec::new();
         let mut via_halo = Vec::new();
         let mut wire_centers = Vec::new();
@@ -358,22 +376,24 @@ impl RoutingGrid {
             let Some(sl) = self.board_to_sig[seg.layer] else {
                 continue;
             };
+            let sl_base = sl * n2d;
             let bb = BBox::from_points(&[seg.a, seg.b], wire_r.max(via_wire_r));
             let (x0, y0, x1, y1) = self.bbox_cells(bb);
             for gy in y0..=y1 {
                 let y = self.y_of(gy);
+                let row = gy * self.cols;
                 for gx in x0..=x1 {
                     let p = Point::new(self.x_of(gx), y);
-                    let d = point_to_segment_dist(p, seg.a, seg.b);
-                    let c2 = gy * self.cols + gx;
-                    if d < wire_r {
-                        wire_halo.push((sl * n2d + c2) as u32);
+                    let d2 = point_to_segment_dist_sq(p, seg.a, seg.b);
+                    let c2 = row + gx;
+                    if d2 < wire_r_sq {
+                        wire_halo.push((sl_base + c2) as u32);
                     }
-                    if d < via_wire_r {
+                    if d2 < via_wire_r_sq {
                         via_halo.push(c2 as u32);
                     }
-                    if d <= self.step * 0.55 {
-                        wire_centers.push((sl * n2d + c2) as u32);
+                    if d2 <= center_r_sq {
+                        wire_centers.push((sl_base + c2) as u32);
                     }
                 }
             }
@@ -387,18 +407,19 @@ impl RoutingGrid {
             let (x0, y0, x1, y1) = self.bbox_cells(bb);
             for gy in y0..=y1 {
                 let y = self.y_of(gy);
+                let row = gy * self.cols;
                 for gx in x0..=x1 {
                     let p = Point::new(self.x_of(gx), y);
-                    let d = p.dist(via.pos);
-                    let c2 = gy * self.cols + gx;
-                    if d < via_wire_r {
+                    let d2 = p.dist_sq(via.pos);
+                    let c2 = row + gx;
+                    if d2 < via_wire_r_sq {
                         for sl in 0..num_sig {
                             if via.layers.contains(&self.sig_layers[sl]) {
                                 wire_halo.push((sl * n2d + c2) as u32);
                             }
                         }
                     }
-                    if d < via_via_r {
+                    if d2 < via_via_r_sq {
                         via_halo.push(c2 as u32);
                     }
                 }
