@@ -724,11 +724,10 @@ impl Board {
                 continue;
             }
             let req = self.wire_to_other_clearance(net_id, pad.net_id) + margin_extra;
-            if let Some(sh) = pad.shape_on_layer(layer) {
-                if sh.dist_to_capsule(a, b, half_w) < req - 1e-4 {
+            if let Some(sh) = pad.shape_on_layer(layer)
+                && sh.dist_to_capsule(a, b, half_w) < req - 1e-4 {
                     return false;
                 }
-            }
         }
 
         // Fixed vias

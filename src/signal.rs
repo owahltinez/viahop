@@ -15,7 +15,7 @@ pub fn install_signal_handlers() {
     unsafe {
         const SIGINT: i32 = 2;
         const SIGTERM: i32 = 15;
-        extern "C" {
+        unsafe extern "C" {
             fn signal(sig: i32, handler: extern "C" fn(i32)) -> usize;
         }
         signal(SIGINT, handle_unix_signal);
@@ -24,7 +24,7 @@ pub fn install_signal_handlers() {
     #[cfg(windows)]
     unsafe {
         #[link(name = "kernel32")]
-        extern "system" {
+        unsafe extern "system" {
             fn SetConsoleCtrlHandler(
                 handler: Option<unsafe extern "system" fn(u32) -> i32>,
                 add: i32,
@@ -52,7 +52,7 @@ extern "C" fn handle_unix_signal(_sig: i32) {
     let prev = STOP_COUNT.fetch_add(1, Ordering::SeqCst);
     GLOBAL_STOP.store(true, Ordering::SeqCst);
     if prev >= 1 {
-        extern "C" {
+        unsafe extern "C" {
             fn _exit(status: i32) -> !;
         }
         unsafe { _exit(130) };

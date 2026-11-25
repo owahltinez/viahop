@@ -144,15 +144,14 @@ where
 
     let global_best = Mutex::new(RouteScore::WORST);
     let notify_best = |routes: &[NetRoute], score: RouteScore| {
-        if let Ok(mut guard) = global_best.lock() {
-            if score.is_better_than(*guard) {
+        if let Ok(mut guard) = global_best.lock()
+            && score.is_better_than(*guard) {
                 *guard = score;
                 drop(guard);
                 if let Some(cb) = on_best {
                     cb(routes, score);
                 }
             }
-        }
     };
 
     // Start 0 uses the canonical net ordering; boards routed cleanly pay zero multi-start cost.
@@ -709,8 +708,8 @@ fn route_single_net(
         let first_node = path[0];
         let last_node = *path.last().unwrap();
 
-        if !node_in_extra(first_node, src_extra, n2d, grid.cols) {
-            if let Some((exact, via_opt, pad_layer)) = match_anchor(&src_entries, first_node) {
+        if !node_in_extra(first_node, src_extra, n2d, grid.cols)
+            && let Some((exact, via_opt, pad_layer)) = match_anchor(&src_entries, first_node) {
                 emit_landing(
                     board,
                     grid,
@@ -725,7 +724,6 @@ fn route_single_net(
                     &mut nr,
                 );
             }
-        }
 
         // Coalesce consecutive collinear grid steps into single segments immediately during routing.
         let mut active_run: Option<(usize, Point, (isize, isize))> = None;
@@ -736,8 +734,8 @@ fn route_single_net(
             let p1 = grid.pt_of(gx1, gy1);
             let p2 = grid.pt_of(gx2, gy2);
             if sl1 != sl2 {
-                if let Some((layer, start_pt, _)) = active_run.take() {
-                    if start_pt.dist(run_end) > 0.5 {
+                if let Some((layer, start_pt, _)) = active_run.take()
+                    && start_pt.dist(run_end) > 0.5 {
                         nr.segments.push(RoutedSegment {
                             layer,
                             a: start_pt,
@@ -745,7 +743,6 @@ fn route_single_net(
                             width: rules.width,
                         });
                     }
-                }
                 push_unique_via(board, net_id, &mut via_positions, &mut nr, p1, rules);
             } else {
                 let bl = grid.sig_layers[sl1];
@@ -755,8 +752,8 @@ fn route_single_net(
                         run_end = p2;
                     }
                     _ => {
-                        if let Some((layer, start_pt, _)) = active_run.take() {
-                            if start_pt.dist(run_end) > 0.5 {
+                        if let Some((layer, start_pt, _)) = active_run.take()
+                            && start_pt.dist(run_end) > 0.5 {
                                 nr.segments.push(RoutedSegment {
                                     layer,
                                     a: start_pt,
@@ -764,15 +761,14 @@ fn route_single_net(
                                     width: rules.width,
                                 });
                             }
-                        }
                         active_run = Some((bl, p1, dir));
                         run_end = p2;
                     }
                 }
             }
         }
-        if let Some((layer, start_pt, _)) = active_run.take() {
-            if start_pt.dist(run_end) > 0.5 {
+        if let Some((layer, start_pt, _)) = active_run.take()
+            && start_pt.dist(run_end) > 0.5 {
                 nr.segments.push(RoutedSegment {
                     layer,
                     a: start_pt,
@@ -780,10 +776,9 @@ fn route_single_net(
                     width: rules.width,
                 });
             }
-        }
 
-        if !node_in_extra(last_node, dst_extra, n2d, grid.cols) {
-            if let Some((exact, via_opt, pad_layer)) = match_anchor(&dst_entries, last_node) {
+        if !node_in_extra(last_node, dst_extra, n2d, grid.cols)
+            && let Some((exact, via_opt, pad_layer)) = match_anchor(&dst_entries, last_node) {
                 emit_landing(
                     board,
                     grid,
@@ -798,7 +793,6 @@ fn route_single_net(
                     &mut nr,
                 );
             }
-        }
 
         let mut merged = std::mem::take(&mut comp_nodes[rb]);
         comp_nodes[ra].append(&mut merged);
@@ -1155,11 +1149,10 @@ fn pads_physically_touch(a: &Pad, b: &Pad) -> bool {
         return false;
     }
     for &(la, ref sa) in &a.layer_shapes {
-        if let Some(sb) = b.shape_on_layer(la) {
-            if sa.dist_to_circle(b.center, 1.0) <= 0.0 || sb.dist_to_circle(a.center, 1.0) <= 0.0 {
+        if let Some(sb) = b.shape_on_layer(la)
+            && (sa.dist_to_circle(b.center, 1.0) <= 0.0 || sb.dist_to_circle(a.center, 1.0) <= 0.0) {
                 return true;
             }
-        }
     }
     false
 }

@@ -10,7 +10,7 @@ use crate::{route, write_ses, DsnDesign, RouterConfig};
 static VERSION_CSTR: &[u8] = concat!(env!("CARGO_PKG_VERSION"), "\0").as_bytes();
 
 /// Returns a static NUL-terminated version string.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn viahop_version() -> *const c_char {
     VERSION_CSTR.as_ptr() as *const c_char
 }
@@ -19,7 +19,7 @@ pub extern "C" fn viahop_version() -> *const c_char {
 ///
 /// # Safety
 /// `ptr` must be NULL or a pointer previously returned by `viahop_route_str`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn viahop_free_str(ptr: *mut c_char) {
     if !ptr.is_null() {
         drop(unsafe { CString::from_raw(ptr) });
@@ -31,7 +31,7 @@ pub unsafe extern "C" fn viahop_free_str(ptr: *mut c_char) {
 ///
 /// # Safety
 /// All non-null string pointers must be valid NUL-terminated C strings.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn viahop_route_file(
     input_dsn_path: *const c_char,
     output_ses_path: *const c_char,
@@ -76,7 +76,7 @@ pub unsafe extern "C" fn viahop_route_file(
 ///
 /// # Safety
 /// `dsn_str` must be a valid NUL-terminated C string. Output pointers may be NULL.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn viahop_route_str(
     dsn_str: *const c_char,
     max_passes: c_int,

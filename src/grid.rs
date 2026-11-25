@@ -188,11 +188,10 @@ impl RoutingGrid {
                     let c2 = gy * cols + gx;
                     let mut hits_via = false;
                     for &(bl, ref sh) in &pad.layer_shapes {
-                        if let Some(sl) = board_to_sig[bl] {
-                            if sh.dist_to_circle(p, def_half_w) < wire_clr {
+                        if let Some(sl) = board_to_sig[bl]
+                            && sh.dist_to_circle(p, def_half_w) < wire_clr {
                                 merge_owner(&mut static_wire[sl * n2d + c2], owner);
                             }
-                        }
                         if !hits_via && sh.dist_to_circle(p, def_via_r) < via_clr {
                             hits_via = true;
                         }
@@ -228,11 +227,10 @@ impl RoutingGrid {
                     let p = Point::new(origin_x + gx as f64 * step, y);
                     let d = point_to_segment_dist(p, fs.a, fs.b) - fs.half_w;
                     let c2 = gy * cols + gx;
-                    if let Some(sl) = sig_opt {
-                        if d - def_half_w < w_clr {
+                    if let Some(sl) = sig_opt
+                        && d - def_half_w < w_clr {
                             merge_owner(&mut static_wire[sl * n2d + c2], owner);
                         }
-                    }
                     if d - def_via_r < v_clr {
                         merge_owner(&mut static_via[c2], owner);
                     }

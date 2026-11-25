@@ -94,11 +94,10 @@ pub fn parse_dsn_tolerant(input: &str) -> Result<SExp, String> {
         }
         extras.push(parser.parse_expr()?);
     }
-    if !extras.is_empty() {
-        if let SExp::List(ref mut items) = root {
+    if !extras.is_empty()
+        && let SExp::List(ref mut items) = root {
             items.extend(extras);
         }
-    }
     Ok(root)
 }
 

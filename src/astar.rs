@@ -21,7 +21,7 @@ pub(crate) struct SearchScratch {
     parent: Vec<u32>,
     seen_gen: Vec<u32>,
     target_gen: Vec<u32>,
-    gen: u32,
+    search_gen: u32,
     tgen: u32,
     heap: BinaryHeap<HeapNode>,
 }
@@ -33,17 +33,17 @@ impl SearchScratch {
             parent: vec![u32::MAX; n3d],
             seen_gen: vec![0; n3d],
             target_gen: vec![0; n3d],
-            gen: 0,
+            search_gen: 0,
             tgen: 0,
             heap: BinaryHeap::with_capacity(4096),
         }
     }
 
     fn next_search(&mut self) {
-        self.gen = self.gen.wrapping_add(1);
-        if self.gen == 0 {
+        self.search_gen = self.search_gen.wrapping_add(1);
+        if self.search_gen == 0 {
             self.seen_gen.fill(0);
-            self.gen = 1;
+            self.search_gen = 1;
         }
         self.tgen = self.tgen.wrapping_add(1);
         if self.tgen == 0 {
@@ -103,7 +103,7 @@ pub(crate) fn astar_connect(
     scratch: &mut SearchScratch,
 ) -> Option<Vec<u32>> {
     scratch.next_search();
-    let gen = scratch.gen;
+    let search_gen = scratch.search_gen;
     let tgen = scratch.tgen;
     let n2d = grid.n2d();
     let cols = grid.cols;
@@ -158,10 +158,10 @@ pub(crate) fn astar_connect(
 
     let mut seed = |node: u32, init_cost: f32| {
         let idx = node as usize;
-        if scratch.seen_gen[idx] == gen && scratch.g_score[idx] <= init_cost {
+        if scratch.seen_gen[idx] == search_gen && scratch.g_score[idx] <= init_cost {
             return;
         }
-        scratch.seen_gen[idx] = gen;
+        scratch.seen_gen[idx] = search_gen;
         scratch.g_score[idx] = init_cost;
         scratch.parent[idx] = u32::MAX;
         let (_, gx, gy) = unpack_node(node, n2d, cols);
@@ -246,8 +246,8 @@ pub(crate) fn astar_connect(
             let cong_mult = (1.0 + occ as f32 * params.present_factor) * (1.0 + hist);
             let ng = g + dist * dir_bias * cong_mult;
 
-            if scratch.seen_gen[nidx] != gen || ng < scratch.g_score[nidx] {
-                scratch.seen_gen[nidx] = gen;
+            if scratch.seen_gen[nidx] != search_gen || ng < scratch.g_score[nidx] {
+                scratch.seen_gen[nidx] = search_gen;
                 scratch.g_score[nidx] = ng;
                 scratch.parent[nidx] = node;
                 scratch.heap.push(HeapNode {
@@ -300,8 +300,8 @@ pub(crate) fn astar_connect(
                         continue;
                     }
                     let ng = g + vcost + wocc as f32 * params.present_factor;
-                    if scratch.seen_gen[nidx] != gen || ng < scratch.g_score[nidx] {
-                        scratch.seen_gen[nidx] = gen;
+                    if scratch.seen_gen[nidx] != search_gen || ng < scratch.g_score[nidx] {
+                        scratch.seen_gen[nidx] = search_gen;
                         scratch.g_score[nidx] = ng;
                         scratch.parent[nidx] = node;
                         scratch.heap.push(HeapNode {

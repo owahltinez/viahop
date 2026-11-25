@@ -43,7 +43,7 @@ jobs:
             archive: zip
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -75,7 +75,7 @@ jobs:
           Copy-Item "include/viahop.h" "$stage/include/"
           Copy-Item "LICENSE", "README.md" "$stage/"
           Compress-Archive -Path "$stage" -DestinationPath "$stage.zip"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: viahop-${{ matrix.target }}
           path: viahop-${{ github.ref_name }}-${{ matrix.target }}.${{ matrix.archive }}
@@ -84,8 +84,8 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true

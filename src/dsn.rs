@@ -210,15 +210,14 @@ impl DsnDesign {
             for rule_node in structure.children_with_tag("rule") {
                 parse_rules_into(rule_node, unit_to_um, &mut default_rules);
             }
-            if let Some(ctrl) = structure.find_child("control") {
-                if let Some(vas) = ctrl.find_child("via_at_smd") {
+            if let Some(ctrl) = structure.find_child("control")
+                && let Some(vas) = ctrl.find_child("via_at_smd") {
                     via_at_smd = vas
                         .as_list()
                         .and_then(|l| l.get(1))
                         .and_then(SExp::as_atom)
                         .is_some_and(|v| v.eq_ignore_ascii_case("on"));
                 }
-            }
         }
 
         let mut placements = Vec::new();
@@ -396,8 +395,8 @@ fn parse_boundary(node: &SExp, scale: f64) -> Option<Vec<Point>> {
             return Some(pts);
         }
     }
-    if let Some(rect) = node.find_child("rect").and_then(SExp::as_list) {
-        if rect.len() >= 6 {
+    if let Some(rect) = node.find_child("rect").and_then(SExp::as_list)
+        && rect.len() >= 6 {
             let x1 = rect[2].as_f64()? * scale;
             let y1 = rect[3].as_f64()? * scale;
             let x2 = rect[4].as_f64()? * scale;
@@ -409,7 +408,6 @@ fn parse_boundary(node: &SExp, scale: f64) -> Option<Vec<Point>> {
                 Point::new(x1, y2),
             ]);
         }
-    }
     None
 }
 
@@ -630,11 +628,10 @@ fn parse_padstack(node: &SExp, scale: f64) -> Option<Padstack> {
     let name = list.get(1)?.as_atom()?.to_string();
     let mut shapes = Vec::new();
     for sh in node.children_with_tag("shape") {
-        if let Some(inner) = sh.as_list().and_then(|l| l.get(1)) {
-            if let Some((layer, shape)) = parse_shape_expr(inner, scale) {
+        if let Some(inner) = sh.as_list().and_then(|l| l.get(1))
+            && let Some((layer, shape)) = parse_shape_expr(inner, scale) {
                 shapes.push(PadShape { layer, shape });
             }
-        }
     }
     let attach = node
         .find_child("attach")
@@ -653,11 +650,10 @@ fn parse_net(node: &SExp) -> Option<DsnNet> {
     let mut pins = Vec::new();
     if let Some(pins_node) = node.find_child("pins").and_then(SExp::as_list) {
         for item in &pins_node[1..] {
-            if let Some(tok) = item.as_atom() {
-                if let Some((refdes, pin)) = tok.split_once('-') {
+            if let Some(tok) = item.as_atom()
+                && let Some((refdes, pin)) = tok.split_once('-') {
                     pins.push((refdes.to_string(), pin.to_string()));
                 }
-            }
         }
     }
     Some(DsnNet { name, pins })
