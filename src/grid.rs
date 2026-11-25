@@ -360,7 +360,6 @@ impl RoutingGrid {
             .max(rules.via_drill + 205.0)
             + 4.0;
         let n2d = self.n2d();
-        let num_sig = self.sig_layers.len();
 
         let wire_r_sq = wire_r * wire_r;
         let via_wire_r_sq = via_wire_r * via_wire_r;
@@ -413,8 +412,8 @@ impl RoutingGrid {
                     let d2 = p.dist_sq(via.pos);
                     let c2 = row + gx;
                     if d2 < via_wire_r_sq {
-                        for sl in 0..num_sig {
-                            if via.layers.contains(&self.sig_layers[sl]) {
+                        for (sl, &bl) in self.sig_layers.iter().enumerate() {
+                            if via.layers.contains(&bl) {
                                 wire_halo.push((sl * n2d + c2) as u32);
                             }
                         }

@@ -572,7 +572,7 @@ fn c_abi_smoke_test() {
         std::fs::write(&tmp_in, two_layer_crossing_dsn()).unwrap();
         let in_c = CString::new(tmp_in.to_str().unwrap()).unwrap();
         let out_c = CString::new(tmp_out.to_str().unwrap()).unwrap();
-        let mut err_buf = [0i8; 256];
+        let mut err_buf = [0 as std::os::raw::c_char; 256];
         let rc2 = viahop_route_file(
             in_c.as_ptr(),
             out_c.as_ptr(),

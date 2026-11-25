@@ -6,7 +6,6 @@ description = "Fast, standalone, zero-dependency headless Specctra DSN/SES multi
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/owahltinez/viahop"
-homepage = "https://github.com/owahltinez/viahop"
 keywords = ["pcb", "autorouter", "kicad", "specctra", "eda"]
 categories = ["command-line-utilities", "science", "hardware-support"]
 

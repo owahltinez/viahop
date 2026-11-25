@@ -83,14 +83,12 @@ pub(crate) fn connected_component_clusters(
     let via_base = k + ns;
 
     // 1. Segment-to-segment electrical contact on the same layer (handles T-junctions).
-    for i in 0..ns {
-        let sa = &nr.segments[i];
+    for (i, sa) in nr.segments.iter().enumerate() {
         let ax0 = sa.a.x.min(sa.b.x);
         let ax1 = sa.a.x.max(sa.b.x);
         let ay0 = sa.a.y.min(sa.b.y);
         let ay1 = sa.a.y.max(sa.b.y);
-        for j in (i + 1)..ns {
-            let sb = &nr.segments[j];
+        for (j, sb) in nr.segments.iter().enumerate().skip(i + 1) {
             if sa.layer != sb.layer {
                 continue;
             }
@@ -111,8 +109,7 @@ pub(crate) fn connected_component_clusters(
     }
 
     // 2. Segment-to-via electrical contact.
-    for i in 0..ns {
-        let s = &nr.segments[i];
+    for (i, s) in nr.segments.iter().enumerate() {
         for (j, v) in nr.vias.iter().enumerate() {
             if !v.layers.contains(&s.layer) {
                 continue;
@@ -127,10 +124,8 @@ pub(crate) fn connected_component_clusters(
     }
 
     // 3. Via-to-via electrical contact.
-    for i in 0..nv {
-        let va = &nr.vias[i];
-        for j in (i + 1)..nv {
-            let vb = &nr.vias[j];
+    for (i, va) in nr.vias.iter().enumerate() {
+        for (j, vb) in nr.vias.iter().enumerate().skip(i + 1) {
             if va.layers.iter().any(|l| vb.layers.contains(l))
                 && va.pos.dist(vb.pos) <= va.radius + vb.radius + 2.0
             {
