@@ -4,7 +4,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::board::{Board, NetRoute, RoutedSegment, RoutedVia, SpatialGrid};
-use crate::geometry::{point_to_segment_dist, segment_to_segment_dist, BBox, Point};
+use crate::geometry::{BBox, Point, point_to_segment_dist, segment_to_segment_dist};
 
 /// Spatial index over all routed segments and vias for fast dynamic clearance checks.
 struct RouteSpatialIndex {
@@ -216,10 +216,10 @@ fn prune_dangling_stubs(board: &Board, nr: &mut NetRoute) {
         nr.segments.retain(|s| {
             let ka = pt_key(s.a);
             let kb = pt_key(s.b);
-            let a_dead = degree[&(s.layer, ka.0, ka.1)] == 1
-                && !anchors.contains(&(s.layer, ka.0, ka.1));
-            let b_dead = degree[&(s.layer, kb.0, kb.1)] == 1
-                && !anchors.contains(&(s.layer, kb.0, kb.1));
+            let a_dead =
+                degree[&(s.layer, ka.0, ka.1)] == 1 && !anchors.contains(&(s.layer, ka.0, ka.1));
+            let b_dead =
+                degree[&(s.layer, kb.0, kb.1)] == 1 && !anchors.contains(&(s.layer, kb.0, kb.1));
             !(a_dead || b_dead)
         });
         if nr.segments.len() == before {
@@ -405,7 +405,11 @@ fn extract_chains(board: &Board, nr: &NetRoute) -> Vec<SegmentChain> {
             }
             visited[next_seg] = true;
             let ns = &nr.segments[next_seg];
-            let next_pt = if pt_key(ns.a) == pt_key(tail) { ns.b } else { ns.a };
+            let next_pt = if pt_key(ns.a) == pt_key(tail) {
+                ns.b
+            } else {
+                ns.a
+            };
             seg_indices.push(next_seg);
             points.push(next_pt);
         }
@@ -421,7 +425,11 @@ fn extract_chains(board: &Board, nr: &NetRoute) -> Vec<SegmentChain> {
             }
             visited[prev_seg] = true;
             let ps = &nr.segments[prev_seg];
-            let prev_pt = if pt_key(ps.b) == pt_key(head) { ps.a } else { ps.b };
+            let prev_pt = if pt_key(ps.b) == pt_key(head) {
+                ps.a
+            } else {
+                ps.b
+            };
             seg_indices.insert(0, prev_seg);
             points.insert(0, prev_pt);
         }
@@ -479,8 +487,18 @@ fn pull_tight_chains(
                 }
                 if j >= i + 3 || !is_octilinear(a, b) {
                     for mid in octilinear_elbows(a, b) {
-                        let s1 = RoutedSegment { layer: chain.layer, a, b: mid, width: chain.width };
-                        let s2 = RoutedSegment { layer: chain.layer, a: mid, b, width: chain.width };
+                        let s1 = RoutedSegment {
+                            layer: chain.layer,
+                            a,
+                            b: mid,
+                            width: chain.width,
+                        };
+                        let s2 = RoutedSegment {
+                            layer: chain.layer,
+                            a: mid,
+                            b,
+                            width: chain.width,
+                        };
                         if a.dist(mid) + mid.dist(b) + 5.0 < sub_len
                             && segment_clear(board, nr.net_id, &s1, index, qbuf, sbuf)
                             && segment_clear(board, nr.net_id, &s2, index, qbuf, sbuf)
@@ -565,7 +583,12 @@ fn flatten_via_chains(
             {
                 continue;
             }
-            let direct = RoutedSegment { layer: cand_l, a: start, b: end, width: chain.width };
+            let direct = RoutedSegment {
+                layer: cand_l,
+                a: start,
+                b: end,
+                width: chain.width,
+            };
             if is_octilinear(start, end)
                 && segment_clear(board, nr.net_id, &direct, index, qbuf, sbuf)
             {
@@ -573,8 +596,18 @@ fn flatten_via_chains(
                 break;
             }
             for mid in octilinear_elbows(start, end) {
-                let s1 = RoutedSegment { layer: cand_l, a: start, b: mid, width: chain.width };
-                let s2 = RoutedSegment { layer: cand_l, a: mid, b: end, width: chain.width };
+                let s1 = RoutedSegment {
+                    layer: cand_l,
+                    a: start,
+                    b: mid,
+                    width: chain.width,
+                };
+                let s2 = RoutedSegment {
+                    layer: cand_l,
+                    a: mid,
+                    b: end,
+                    width: chain.width,
+                };
                 if segment_clear(board, nr.net_id, &s1, index, qbuf, sbuf)
                     && segment_clear(board, nr.net_id, &s2, index, qbuf, sbuf)
                 {
@@ -588,7 +621,12 @@ fn flatten_via_chains(
             let moved: Vec<RoutedSegment> = chain
                 .points
                 .windows(2)
-                .map(|w| RoutedSegment { layer: cand_l, a: w[0], b: w[1], width: chain.width })
+                .map(|w| RoutedSegment {
+                    layer: cand_l,
+                    a: w[0],
+                    b: w[1],
+                    width: chain.width,
+                })
                 .collect();
             if moved
                 .iter()

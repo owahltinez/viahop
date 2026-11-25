@@ -1,7 +1,7 @@
 //! Zero-dependency SIGINT/SIGTERM handling for graceful stop and checkpoint preservation.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 static STOP_COUNT: AtomicUsize = AtomicUsize::new(0);
 static GLOBAL_STOP: AtomicBool = AtomicBool::new(false);
@@ -37,8 +37,7 @@ pub fn install_signal_handlers() {
 /// Returns true if a termination signal has been received.
 #[inline]
 pub fn stop_requested(extra: Option<&Arc<AtomicBool>>) -> bool {
-    GLOBAL_STOP.load(Ordering::Relaxed)
-        || extra.is_some_and(|flag| flag.load(Ordering::Relaxed))
+    GLOBAL_STOP.load(Ordering::Relaxed) || extra.is_some_and(|flag| flag.load(Ordering::Relaxed))
 }
 
 /// Resets the global signal stop flag (intended for tests).

@@ -6,7 +6,7 @@ use std::fmt;
 #[derive(Debug, Clone, PartialEq)]
 pub enum SExp {
     Atom(String),
-    List(Vec<SExp>),
+    List(Vec<Self>),
 }
 
 impl SExp {
@@ -17,7 +17,7 @@ impl SExp {
         }
     }
 
-    pub fn as_list(&self) -> Option<&[SExp]> {
+    pub fn as_list(&self) -> Option<&[Self]> {
         match self {
             Self::List(items) => Some(items.as_slice()),
             Self::Atom(_) => None,
@@ -38,7 +38,7 @@ impl SExp {
     }
 
     /// Returns the first child list whose tag matches `tag`.
-    pub fn find_child(&self, tag: &str) -> Option<&SExp> {
+    pub fn find_child(&self, tag: &str) -> Option<&Self> {
         self.as_list()?
             .iter()
             .skip(1)
@@ -46,12 +46,9 @@ impl SExp {
     }
 
     /// Iterates over all direct child lists whose tag matches `tag`.
-    pub fn children_with_tag<'a>(&'a self, tag: &'a str) -> impl Iterator<Item = &'a SExp> {
+    pub fn children_with_tag<'a>(&'a self, tag: &'a str) -> impl Iterator<Item = &'a Self> {
         let slice = self.as_list().unwrap_or(&[]);
-        slice
-            .iter()
-            .skip(1)
-            .filter(move |c| c.tag() == Some(tag))
+        slice.iter().skip(1).filter(move |c| c.tag() == Some(tag))
     }
 }
 
@@ -69,9 +66,10 @@ pub fn parse(input: &str) -> Result<SExp, String> {
     Ok(expr)
 }
 
-/// Parses a top-level Specctra `(pcb ...)` document, tolerating stray extra `)`
-/// tokens that prematurely close `(pcb ...)` before sibling sections such as
-/// `(placement ...)`, `(library ...)`, `(network ...)`, or `(wiring ...)`.
+/// Parses a top-level Specctra `(pcb ...)` document, tolerating stray `)` tokens.
+///
+/// Absorbs stray closing parentheses that prematurely close `(pcb ...)` before sibling
+/// sections like `(placement ...)`, `(library ...)`, `(network ...)`, or `(wiring ...)`.
 pub fn parse_dsn_tolerant(input: &str) -> Result<SExp, String> {
     let quote_char = detect_string_quote(input).unwrap_or('"');
     let mut parser = Parser {
@@ -95,9 +93,10 @@ pub fn parse_dsn_tolerant(input: &str) -> Result<SExp, String> {
         extras.push(parser.parse_expr()?);
     }
     if !extras.is_empty()
-        && let SExp::List(ref mut items) = root {
-            items.extend(extras);
-        }
+        && let SExp::List(ref mut items) = root
+    {
+        items.extend(extras);
+    }
     Ok(root)
 }
 
@@ -265,7 +264,10 @@ impl<'a> Parser<'a> {
         let mut buf = Vec::new();
         while self.pos < self.bytes.len() {
             let b = self.bytes[self.pos];
-            if b == b'\\' && self.pos + 1 < self.bytes.len() && self.bytes[self.pos + 1] == self.quote {
+            if b == b'\\'
+                && self.pos + 1 < self.bytes.len()
+                && self.bytes[self.pos + 1] == self.quote
+            {
                 buf.push(self.quote);
                 self.pos += 2;
             } else if b == self.quote {
@@ -278,7 +280,9 @@ impl<'a> Parser<'a> {
                 self.pos += 1;
             }
         }
-        Err(format!("unterminated quoted string starting at byte {start}"))
+        Err(format!(
+            "unterminated quoted string starting at byte {start}"
+        ))
     }
 
     fn parse_atom(&mut self) -> Result<SExp, String> {
@@ -302,7 +306,8 @@ mod tests {
 
     #[test]
     fn parses_nested_and_quoted() {
-        let src = r#"(pcb "/tmp/a b.dsn" (parser (string_quote ")) (net /Audio/CLAMP_L (pins D1-3)))"#;
+        let src =
+            r#"(pcb "/tmp/a b.dsn" (parser (string_quote ")) (net /Audio/CLAMP_L (pins D1-3)))"#;
         let expr = parse(src).unwrap();
         assert_eq!(expr.tag(), Some("pcb"));
         assert_eq!(expr.as_list().unwrap()[1].as_atom(), Some("/tmp/a b.dsn"));

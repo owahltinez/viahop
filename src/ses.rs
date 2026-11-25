@@ -7,7 +7,7 @@ use std::path::Path;
 use crate::board::{Board, NetRoute, RoutedSegment, RoutedVia};
 use crate::dsn::{DsnDesign, Side};
 use crate::geometry::{Point, Shape};
-use crate::sexp::{self, format_atom, SExp};
+use crate::sexp::{self, SExp, format_atom};
 
 /// Serializes routed tracks and vias into a Specctra `.ses` file compatible with
 /// KiCad 10's `pcbnew.ImportSpecctraSES`.
@@ -24,7 +24,12 @@ pub fn write_ses(design: &DsnDesign, board: &Board, routes: &[NetRoute]) -> Stri
 
     // Placement block (grouped by component name).
     let _ = writeln!(out, "  (placement");
-    let _ = writeln!(out, "    (resolution {} {})", format_atom(res_unit), res_div as i64);
+    let _ = writeln!(
+        out,
+        "    (resolution {} {})",
+        format_atom(res_unit),
+        res_div as i64
+    );
     let mut by_comp: BTreeMap<&str, Vec<&crate::dsn::ComponentPlace>> = BTreeMap::new();
     for p in &design.placements {
         by_comp.entry(p.component.as_str()).or_default().push(p);
@@ -54,10 +59,19 @@ pub fn write_ses(design: &DsnDesign, board: &Board, routes: &[NetRoute]) -> Stri
     let _ = writeln!(out, "  )");
 
     let _ = writeln!(out, "  (routes");
-    let _ = writeln!(out, "    (resolution {} {})", format_atom(res_unit), res_div as i64);
+    let _ = writeln!(
+        out,
+        "    (resolution {} {})",
+        format_atom(res_unit),
+        res_div as i64
+    );
     let _ = writeln!(out, "    (parser");
     let _ = writeln!(out, "      (host_cad {})", format_atom(&design.host_cad));
-    let _ = writeln!(out, "      (host_version {})", format_atom(&design.host_version));
+    let _ = writeln!(
+        out,
+        "      (host_version {})",
+        format_atom(&design.host_version)
+    );
     let _ = writeln!(out, "    )");
 
     // library_out: emit deduplicated via padstacks used by routed vias (plus default structure vias).
@@ -149,7 +163,11 @@ fn write_via_padstack(
                 let _ = writeln!(out, "        )");
             }
         }
-        let _ = writeln!(out, "        (attach {})", if ps.attach { "on" } else { "off" });
+        let _ = writeln!(
+            out,
+            "        (attach {})",
+            if ps.attach { "on" } else { "off" }
+        );
     } else {
         let dia = 250.0;
         for lname in &board.layer_names {
@@ -169,9 +187,8 @@ fn write_via_padstack(
 
 /// Joins contiguous segments on the same layer & width into compact polylines in O(N) time.
 fn chain_segments(segments: &[RoutedSegment]) -> Vec<(usize, f64, Vec<Point>)> {
-    let pt_key = |p: Point| -> (i64, i64) {
-        ((p.x * 100.0).round() as i64, (p.y * 100.0).round() as i64)
-    };
+    let pt_key =
+        |p: Point| -> (i64, i64) { ((p.x * 100.0).round() as i64, (p.y * 100.0).round() as i64) };
     let mut adj: HashMap<(usize, i64, i64), Vec<usize>> = HashMap::new();
     for (i, s) in segments.iter().enumerate() {
         let ka = pt_key(s.a);
@@ -182,22 +199,23 @@ fn chain_segments(segments: &[RoutedSegment]) -> Vec<(usize, f64, Vec<Point>)> {
 
     let mut out = Vec::new();
     let mut used = vec![false; segments.len()];
-    let find_next = |tip: Point, layer: usize, width: f64, used: &[bool]| -> Option<(usize, Point)> {
-        let tk = pt_key(tip);
-        let cands = adj.get(&(layer, tk.0, tk.1))?;
-        for &j in cands {
-            if used[j] || (segments[j].width - width).abs() > 0.1 {
-                continue;
+    let find_next =
+        |tip: Point, layer: usize, width: f64, used: &[bool]| -> Option<(usize, Point)> {
+            let tk = pt_key(tip);
+            let cands = adj.get(&(layer, tk.0, tk.1))?;
+            for &j in cands {
+                if used[j] || (segments[j].width - width).abs() > 0.1 {
+                    continue;
+                }
+                if segments[j].a.dist_sq(tip) < 1e-4 {
+                    return Some((j, segments[j].b));
+                }
+                if segments[j].b.dist_sq(tip) < 1e-4 {
+                    return Some((j, segments[j].a));
+                }
             }
-            if segments[j].a.dist_sq(tip) < 1e-4 {
-                return Some((j, segments[j].b));
-            }
-            if segments[j].b.dist_sq(tip) < 1e-4 {
-                return Some((j, segments[j].a));
-            }
-        }
-        None
-    };
+            None
+        };
 
     for i in 0..segments.len() {
         if used[i] {
@@ -254,7 +272,10 @@ fn base_stem(raw: &str) -> String {
 pub fn parse_ses(input: &str, board: &Board) -> Result<Vec<NetRoute>, String> {
     let root = sexp::parse(input)?;
     if root.tag() != Some("session") {
-        return Err(format!("expected top-level (session ...), got {:?}", root.tag()));
+        return Err(format!(
+            "expected top-level (session ...), got {:?}",
+            root.tag()
+        ));
     }
     let mut routes: Vec<NetRoute> = (0..board.nets.len())
         .map(|net_id| NetRoute {
@@ -362,7 +383,11 @@ pub fn parse_ses(input: &str, board: &Board) -> Result<Vec<NetRoute>, String> {
 
 fn parse_ses_resolution(routes_node: &SExp) -> (String, f64) {
     if let Some(res) = routes_node.find_child("resolution").and_then(SExp::as_list) {
-        let unit = res.get(1).and_then(SExp::as_atom).unwrap_or("um").to_string();
+        let unit = res
+            .get(1)
+            .and_then(SExp::as_atom)
+            .unwrap_or("um")
+            .to_string();
         let div = res.get(2).and_then(SExp::as_f64).unwrap_or(10.0);
         return (unit, div);
     }

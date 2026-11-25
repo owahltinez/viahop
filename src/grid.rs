@@ -6,8 +6,8 @@ use crate::board::{Board, NetRoute};
 use crate::drc::DrcReport;
 use crate::fanout::FanoutPlan;
 use crate::geometry::{
-    point_in_polygon, point_to_polygon_edge_dist, point_to_segment_dist, point_to_segment_dist_sq,
-    BBox, Point,
+    BBox, Point, point_in_polygon, point_to_polygon_edge_dist, point_to_segment_dist,
+    point_to_segment_dist_sq,
 };
 
 pub const STATIC_OPEN: u32 = 0;
@@ -128,10 +128,10 @@ impl RoutingGrid {
                 .clamp(0, (cols - 1) as isize) as usize;
             let gy0 = (((bb.min_y - origin_y) / step).floor() as isize)
                 .clamp(0, (rows - 1) as isize) as usize;
-            let gx1 = (((bb.max_x - origin_x) / step).ceil() as isize)
-                .clamp(0, (cols - 1) as isize) as usize;
-            let gy1 = (((bb.max_y - origin_y) / step).ceil() as isize)
-                .clamp(0, (rows - 1) as isize) as usize;
+            let gx1 = (((bb.max_x - origin_x) / step).ceil() as isize).clamp(0, (cols - 1) as isize)
+                as usize;
+            let gy1 = (((bb.max_y - origin_y) / step).ceil() as isize).clamp(0, (rows - 1) as isize)
+                as usize;
             (gx0, gy0, gx1, gy1)
         };
 
@@ -171,15 +171,18 @@ impl RoutingGrid {
                 .net_id
                 .map_or(def_clr, |id| board.nets[id].rules.clearance.max(def_clr));
             let via_clr = if pad.is_smd {
-                pad.net_id
-                    .map_or(def_via_smd, |id| board.nets[id].rules.via_smd.max(def_via_smd))
+                pad.net_id.map_or(def_via_smd, |id| {
+                    board.nets[id].rules.via_smd.max(def_via_smd)
+                })
             } else {
-                pad.net_id
-                    .map_or(def_via_via, |id| board.nets[id].rules.via_via.max(def_via_via))
+                pad.net_id.map_or(def_via_via, |id| {
+                    board.nets[id].rules.via_via.max(def_via_via)
+                })
             };
             let expand = def_via_r + via_clr.max(wire_clr) + def_half_w + 10.0;
             let (x0, y0, x1, y1) = bbox_cells(pad.bbox.expand(expand));
-            let allow_pofv_here = pad.is_smd && board.via_at_smd && fanout.pads[pad.id].pofv_allowed;
+            let allow_pofv_here =
+                pad.is_smd && board.via_at_smd && fanout.pads[pad.id].pofv_allowed;
 
             for gy in y0..=y1 {
                 let y = origin_y + gy as f64 * step;
@@ -189,9 +192,10 @@ impl RoutingGrid {
                     let mut hits_via = false;
                     for &(bl, ref sh) in &pad.layer_shapes {
                         if let Some(sl) = board_to_sig[bl]
-                            && sh.dist_to_circle(p, def_half_w) < wire_clr {
-                                merge_owner(&mut static_wire[sl * n2d + c2], owner);
-                            }
+                            && sh.dist_to_circle(p, def_half_w) < wire_clr
+                        {
+                            merge_owner(&mut static_wire[sl * n2d + c2], owner);
+                        }
                         if !hits_via && sh.dist_to_circle(p, def_via_r) < via_clr {
                             hits_via = true;
                         }
@@ -214,9 +218,9 @@ impl RoutingGrid {
             let w_clr = fs
                 .net_id
                 .map_or(def_clr, |id| board.nets[id].rules.clearance.max(def_clr));
-            let v_clr = fs
-                .net_id
-                .map_or(def_via_wire, |id| board.nets[id].rules.via_wire.max(def_via_wire));
+            let v_clr = fs.net_id.map_or(def_via_wire, |id| {
+                board.nets[id].rules.via_wire.max(def_via_wire)
+            });
             let expand = def_via_r + v_clr.max(w_clr) + def_half_w + 10.0;
             let (x0, y0, x1, y1) = bbox_cells(fs.bbox.expand(expand));
             let sig_opt = board_to_sig[fs.layer];
@@ -228,9 +232,10 @@ impl RoutingGrid {
                     let d = point_to_segment_dist(p, fs.a, fs.b) - fs.half_w;
                     let c2 = gy * cols + gx;
                     if let Some(sl) = sig_opt
-                        && d - def_half_w < w_clr {
-                            merge_owner(&mut static_wire[sl * n2d + c2], owner);
-                        }
+                        && d - def_half_w < w_clr
+                    {
+                        merge_owner(&mut static_wire[sl * n2d + c2], owner);
+                    }
                     if d - def_via_r < v_clr {
                         merge_owner(&mut static_via[c2], owner);
                     }
@@ -241,16 +246,14 @@ impl RoutingGrid {
         // 5. Rasterize fixed vias.
         for fv in &board.fixed_vias {
             let owner = fv.net_id.map_or(STATIC_BLOCKED, |id| (id as u32) + 1);
-            let vw_clr = fv
-                .net_id
-                .map_or(def_via_wire, |id| board.nets[id].rules.via_wire.max(def_via_wire));
-            let vv_clr = fv
-                .net_id
-                .map_or(def_via_via, |id| board.nets[id].rules.via_via.max(def_via_via));
+            let vw_clr = fv.net_id.map_or(def_via_wire, |id| {
+                board.nets[id].rules.via_wire.max(def_via_wire)
+            });
+            let vv_clr = fv.net_id.map_or(def_via_via, |id| {
+                board.nets[id].rules.via_via.max(def_via_via)
+            });
             let hole_c2c = (fv.drill + def_via_drill) * 0.5 + 205.0;
-            let expand = (fv.radius + def_via_r + vv_clr.max(vw_clr))
-                .max(hole_c2c)
-                + 15.0;
+            let expand = (fv.radius + def_via_r + vv_clr.max(vw_clr)).max(hole_c2c) + 15.0;
             let (x0, y0, x1, y1) = bbox_cells(BBox::from_point(fv.pos, expand));
 
             for gy in y0..=y1 {
@@ -354,9 +357,7 @@ impl RoutingGrid {
         let rules = &board.nets[route.net_id].rules;
         let wire_r = rules.width + rules.clearance + 4.0;
         let via_wire_r = rules.via_radius + rules.width * 0.5 + rules.via_wire + 4.0;
-        let via_via_r = (2.0 * rules.via_radius + rules.via_via)
-            .max(rules.via_drill + 205.0)
-            + 4.0;
+        let via_via_r = (2.0 * rules.via_radius + rules.via_via).max(rules.via_drill + 205.0) + 4.0;
         let n2d = self.n2d();
 
         let wire_r_sq = wire_r * wire_r;
@@ -471,7 +472,9 @@ impl RoutingGrid {
     }
 
     pub fn has_conflict(&self, fp: &NetFootprint) -> bool {
-        fp.wire_centers.iter().any(|&c| self.wire_occ[c as usize] > 1)
+        fp.wire_centers
+            .iter()
+            .any(|&c| self.wire_occ[c as usize] > 1)
             || fp.via_centers.iter().any(|&c| self.via_occ[c as usize] > 1)
     }
 

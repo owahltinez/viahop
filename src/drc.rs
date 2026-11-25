@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 
 use crate::board::{Board, NetRoute, RoutedSegment, RoutedVia, SpatialGrid};
-use crate::geometry::{segment_to_segment_dist, BBox, Point, Shape};
+use crate::geometry::{BBox, Point, Shape, segment_to_segment_dist};
 
 /// Exact continuous-geometry DRC violation.
 #[derive(Debug, Clone)]

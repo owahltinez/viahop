@@ -4,8 +4,8 @@ use std::collections::{HashMap, HashSet};
 
 use crate::dsn::{DsnDesign, KeepoutKind, Rules, Side, WireType};
 use crate::geometry::{
-    point_in_polygon, point_to_polygon_edge_dist, segment_to_polygon_dist, segment_to_segment_dist,
-    transform_point, BBox, Point, Shape,
+    BBox, Point, Shape, point_in_polygon, point_to_polygon_edge_dist, segment_to_polygon_dist,
+    segment_to_segment_dist, transform_point,
 };
 
 /// Resolved design rules for a specific net (all dimensions in micrometers).
@@ -46,7 +46,10 @@ impl Pad {
     }
 
     pub fn shape_on_layer(&self, layer: usize) -> Option<&Shape> {
-        self.layer_shapes.iter().find(|(l, _)| *l == layer).map(|(_, s)| s)
+        self.layer_shapes
+            .iter()
+            .find(|(l, _)| *l == layer)
+            .map(|(_, s)| s)
     }
 }
 
@@ -141,8 +144,10 @@ impl SpatialGrid {
         let margin = cell_size * 2.0;
         let origin_x = bounds.min_x - margin;
         let origin_y = bounds.min_y - margin;
-        let cols = (((bounds.max_x - bounds.min_x + 2.0 * margin) / cell_size).ceil() as usize).max(1);
-        let rows = (((bounds.max_y - bounds.min_y + 2.0 * margin) / cell_size).ceil() as usize).max(1);
+        let cols =
+            (((bounds.max_x - bounds.min_x + 2.0 * margin) / cell_size).ceil() as usize).max(1);
+        let rows =
+            (((bounds.max_y - bounds.min_y + 2.0 * margin) / cell_size).ceil() as usize).max(1);
         Self {
             cell_size,
             origin_x,
@@ -189,7 +194,12 @@ impl SpatialGrid {
             let idx = ((y - self.origin_y) / self.cell_size).floor() as isize;
             idx.clamp(0, (self.rows - 1) as isize) as usize
         };
-        (gx(bbox.min_x), gy(bbox.min_y), gx(bbox.max_x), gy(bbox.max_y))
+        (
+            gx(bbox.min_x),
+            gy(bbox.min_y),
+            gx(bbox.max_x),
+            gy(bbox.max_y),
+        )
     }
 }
 
@@ -215,7 +225,11 @@ pub struct Board {
 }
 
 impl Board {
-    pub fn from_dsn(design: &DsnDesign, ignored: &HashSet<String>, force_via_at_smd: Option<bool>) -> Result<Self, String> {
+    pub fn from_dsn(
+        design: &DsnDesign,
+        ignored: &HashSet<String>,
+        force_via_at_smd: Option<bool>,
+    ) -> Result<Self, String> {
         if design.layers.is_empty() {
             return Err("DSN contains no copper layers".to_string());
         }
@@ -225,9 +239,8 @@ impl Board {
         let mut signal_layers = Vec::new();
         for (i, l) in design.layers.iter().enumerate() {
             layer_name_to_idx.insert(l.name.clone(), i);
-            let has_inner_plane = i > 0
-                && i + 1 < num_layers
-                && design.planes.iter().any(|p| p.layer == l.name);
+            let has_inner_plane =
+                i > 0 && i + 1 < num_layers && design.planes.iter().any(|p| p.layer == l.name);
             if l.is_signal && !has_inner_plane {
                 signal_layers.push(i);
             }
@@ -384,9 +397,7 @@ impl Board {
                             p1.center.y + (p2.center.y - p1.center.y) * 0.58,
                         );
                         let pad_r = |p: &Pad| {
-                            ((p.bbox.max_x - p.bbox.min_x)
-                                .min(p.bbox.max_y - p.bbox.min_y))
-                                * 0.5
+                            ((p.bbox.max_x - p.bbox.min_x).min(p.bbox.max_y - p.bbox.min_y)) * 0.5
                         };
                         let half_w = pad_r(p1).min(pad_r(p2)).max(120.0);
                         fixed_segments.push(FixedSegment {
@@ -452,8 +463,11 @@ impl Board {
 
         for (id, dnet) in design.nets.iter().enumerate() {
             let cls = net_to_class.get(dnet.name.as_str()).copied();
-            let class_name = cls.map(|c| c.name.clone()).unwrap_or_else(|| "default".to_string());
-            let rules = resolve_net_rules(design, cls, &default_via, &layer_name_to_idx, num_layers);
+            let class_name = cls
+                .map(|c| c.name.clone())
+                .unwrap_or_else(|| "default".to_string());
+            let rules =
+                resolve_net_rules(design, cls, &default_via, &layer_name_to_idx, num_layers);
             let is_ignored = ignored.contains(&dnet.name) || ignored.contains(&class_name);
             nets.push(NetInfo {
                 id,
@@ -725,9 +739,10 @@ impl Board {
             }
             let req = self.wire_to_other_clearance(net_id, pad.net_id) + margin_extra;
             if let Some(sh) = pad.shape_on_layer(layer)
-                && sh.dist_to_capsule(a, b, half_w) < req - 1e-4 {
-                    return false;
-                }
+                && sh.dist_to_capsule(a, b, half_w) < req - 1e-4
+            {
+                return false;
+            }
         }
 
         // Fixed vias

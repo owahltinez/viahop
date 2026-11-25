@@ -158,10 +158,17 @@ impl DsnDesign {
     pub fn parse(input: &str) -> Result<Self, String> {
         let root = sexp::parse_dsn_tolerant(input)?;
         if root.tag() != Some("pcb") {
-            return Err(format!("expected top-level (pcb ...), got {:?}", root.tag()));
+            return Err(format!(
+                "expected top-level (pcb ...), got {:?}",
+                root.tag()
+            ));
         }
         let items = root.as_list().ok_or("invalid root")?;
-        let name = items.get(1).and_then(SExp::as_atom).unwrap_or("design").to_string();
+        let name = items
+            .get(1)
+            .and_then(SExp::as_atom)
+            .unwrap_or("design")
+            .to_string();
 
         let (host_cad, host_version) = parse_parser_section(&root);
         let (resolution_unit, resolution_divisor) = parse_resolution(&root);
@@ -211,13 +218,14 @@ impl DsnDesign {
                 parse_rules_into(rule_node, unit_to_um, &mut default_rules);
             }
             if let Some(ctrl) = structure.find_child("control")
-                && let Some(vas) = ctrl.find_child("via_at_smd") {
-                    via_at_smd = vas
-                        .as_list()
-                        .and_then(|l| l.get(1))
-                        .and_then(SExp::as_atom)
-                        .is_some_and(|v| v.eq_ignore_ascii_case("on"));
-                }
+                && let Some(vas) = ctrl.find_child("via_at_smd")
+            {
+                via_at_smd = vas
+                    .as_list()
+                    .and_then(|l| l.get(1))
+                    .and_then(SExp::as_atom)
+                    .is_some_and(|v| v.eq_ignore_ascii_case("on"));
+            }
         }
 
         let mut placements = Vec::new();
@@ -348,10 +356,16 @@ fn parse_parser_section(root: &SExp) -> (String, String) {
     let mut cad = "KiCad's Pcbnew".to_string();
     let mut ver = "10.0".to_string();
     if let Some(p) = root.find_child("parser") {
-        if let Some(c) = p.find_child("host_cad").and_then(|n| n.as_list()?.get(1)?.as_atom()) {
+        if let Some(c) = p
+            .find_child("host_cad")
+            .and_then(|n| n.as_list()?.get(1)?.as_atom())
+        {
             cad = c.to_string();
         }
-        if let Some(v) = p.find_child("host_version").and_then(|n| n.as_list()?.get(1)?.as_atom()) {
+        if let Some(v) = p
+            .find_child("host_version")
+            .and_then(|n| n.as_list()?.get(1)?.as_atom())
+        {
             ver = v.to_string();
         }
     }
@@ -360,7 +374,11 @@ fn parse_parser_section(root: &SExp) -> (String, String) {
 
 fn parse_resolution(root: &SExp) -> (String, f64) {
     if let Some(res) = root.find_child("resolution").and_then(SExp::as_list) {
-        let unit = res.get(1).and_then(SExp::as_atom).unwrap_or("um").to_string();
+        let unit = res
+            .get(1)
+            .and_then(SExp::as_atom)
+            .unwrap_or("um")
+            .to_string();
         let div = res.get(2).and_then(SExp::as_f64).unwrap_or(10.0);
         return (unit, div);
     }
@@ -396,18 +414,19 @@ fn parse_boundary(node: &SExp, scale: f64) -> Option<Vec<Point>> {
         }
     }
     if let Some(rect) = node.find_child("rect").and_then(SExp::as_list)
-        && rect.len() >= 6 {
-            let x1 = rect[2].as_f64()? * scale;
-            let y1 = rect[3].as_f64()? * scale;
-            let x2 = rect[4].as_f64()? * scale;
-            let y2 = rect[5].as_f64()? * scale;
-            return Some(vec![
-                Point::new(x1, y1),
-                Point::new(x2, y1),
-                Point::new(x2, y2),
-                Point::new(x1, y2),
-            ]);
-        }
+        && rect.len() >= 6
+    {
+        let x1 = rect[2].as_f64()? * scale;
+        let y1 = rect[3].as_f64()? * scale;
+        let x2 = rect[4].as_f64()? * scale;
+        let y2 = rect[5].as_f64()? * scale;
+        return Some(vec![
+            Point::new(x1, y1),
+            Point::new(x2, y1),
+            Point::new(x2, y2),
+            Point::new(x1, y2),
+        ]);
+    }
     None
 }
 
@@ -428,7 +447,9 @@ fn parse_keepouts_in(parent: &SExp, scale: f64, out: &mut Vec<Keepout>) {
             Some("wire_keepout") => KeepoutKind::Wire,
             _ => continue,
         };
-        let Some(klist) = child.as_list() else { continue };
+        let Some(klist) = child.as_list() else {
+            continue;
+        };
         for sub in &klist[1..] {
             if let Some((layer, shape)) = parse_shape_expr(sub, scale) {
                 out.push(Keepout { kind, layer, shape });
@@ -501,7 +522,9 @@ fn parse_shape_expr(node: &SExp, scale: f64) -> Option<(String, Shape)> {
 fn parse_rules_into(node: &SExp, scale: f64, rules: &mut Rules) {
     let Some(list) = node.as_list() else { return };
     for child in &list[1..] {
-        let Some(clist) = child.as_list() else { continue };
+        let Some(clist) = child.as_list() else {
+            continue;
+        };
         match child.tag() {
             Some("width") => {
                 if let Some(w) = clist.get(1).and_then(SExp::as_f64) {
@@ -552,11 +575,17 @@ fn merge_rules(dst: &mut Rules, src: &Rules) {
 }
 
 fn parse_component_places(comp_node: &SExp, scale: f64, out: &mut Vec<ComponentPlace>) {
-    let Some(list) = comp_node.as_list() else { return };
-    let Some(component) = list.get(1).and_then(SExp::as_atom) else { return };
+    let Some(list) = comp_node.as_list() else {
+        return;
+    };
+    let Some(component) = list.get(1).and_then(SExp::as_atom) else {
+        return;
+    };
     for place in comp_node.children_with_tag("place") {
         let Some(pl) = place.as_list() else { continue };
-        let Some(refdes) = pl.get(1).and_then(SExp::as_atom) else { continue };
+        let Some(refdes) = pl.get(1).and_then(SExp::as_atom) else {
+            continue;
+        };
         let (Some(x), Some(y)) = (
             pl.get(2).and_then(SExp::as_f64),
             pl.get(3).and_then(SExp::as_f64),
@@ -588,8 +617,12 @@ fn parse_image(node: &SExp, scale: f64) -> Option<Image> {
     let name = list.get(1)?.as_atom()?.to_string();
     let mut pins = Vec::new();
     for pin_node in node.children_with_tag("pin") {
-        let Some(pl) = pin_node.as_list() else { continue };
-        let Some(padstack) = pl.get(1).and_then(SExp::as_atom) else { continue };
+        let Some(pl) = pin_node.as_list() else {
+            continue;
+        };
+        let Some(padstack) = pl.get(1).and_then(SExp::as_atom) else {
+            continue;
+        };
         let (rotation_deg, idx) = if pl.get(2).and_then(SExp::tag) == Some("rotate") {
             let deg = pl[2]
                 .as_list()
@@ -600,7 +633,9 @@ fn parse_image(node: &SExp, scale: f64) -> Option<Image> {
         } else {
             (0.0, 2)
         };
-        let Some(pin_name) = pl.get(idx).and_then(SExp::as_atom) else { continue };
+        let Some(pin_name) = pl.get(idx).and_then(SExp::as_atom) else {
+            continue;
+        };
         let (Some(x), Some(y)) = (
             pl.get(idx + 1).and_then(SExp::as_f64),
             pl.get(idx + 2).and_then(SExp::as_f64),
@@ -629,9 +664,10 @@ fn parse_padstack(node: &SExp, scale: f64) -> Option<Padstack> {
     let mut shapes = Vec::new();
     for sh in node.children_with_tag("shape") {
         if let Some(inner) = sh.as_list().and_then(|l| l.get(1))
-            && let Some((layer, shape)) = parse_shape_expr(inner, scale) {
-                shapes.push(PadShape { layer, shape });
-            }
+            && let Some((layer, shape)) = parse_shape_expr(inner, scale)
+        {
+            shapes.push(PadShape { layer, shape });
+        }
     }
     let attach = node
         .find_child("attach")
@@ -651,9 +687,10 @@ fn parse_net(node: &SExp) -> Option<DsnNet> {
     if let Some(pins_node) = node.find_child("pins").and_then(SExp::as_list) {
         for item in &pins_node[1..] {
             if let Some(tok) = item.as_atom()
-                && let Some((refdes, pin)) = tok.split_once('-') {
-                    pins.push((refdes.to_string(), pin.to_string()));
-                }
+                && let Some((refdes, pin)) = tok.split_once('-')
+            {
+                pins.push((refdes.to_string(), pin.to_string()));
+            }
         }
     }
     Some(DsnNet { name, pins })

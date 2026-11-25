@@ -2,14 +2,14 @@
 
 use std::fmt::Write;
 
-use crate::astar::{astar_connect, PassParams, SearchScratch};
+use crate::astar::{PassParams, SearchScratch, astar_connect};
 use crate::board::{Board, NetRoute};
 use crate::connectivity::connected_component_clusters;
 use crate::drc::check_drc;
 use crate::fanout::analyze_fanout;
 use crate::geometry::Point;
 use crate::grid::RoutingGrid;
-use crate::router::{build_mst, build_net_components, RouteStats, Terminal};
+use crate::router::{RouteStats, Terminal, build_mst, build_net_components};
 
 /// Classification of why an unconnected net pair failed to route.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,9 +115,19 @@ impl RouteReport {
 
         let _ = writeln!(out, "  \"violations\": [");
         for (i, v) in self.violations.iter().enumerate() {
-            let comma = if i + 1 < self.violations.len() { "," } else { "" };
-            let net_b = v.net_b.as_deref().map_or_else(|| "null".to_string(), json_str);
-            let layer = v.layer.as_deref().map_or_else(|| "null".to_string(), json_str);
+            let comma = if i + 1 < self.violations.len() {
+                ","
+            } else {
+                ""
+            };
+            let net_b = v
+                .net_b
+                .as_deref()
+                .map_or_else(|| "null".to_string(), json_str);
+            let layer = v
+                .layer
+                .as_deref()
+                .map_or_else(|| "null".to_string(), json_str);
             let _ = writeln!(
                 out,
                 "    {{\"kind\":{},\"net_a\":{},\"net_b\":{},\"layer\":{},\"pos_um\":[{:.1},{:.1}],\"gap_um\":{:.2},\"required_um\":{:.2}}}{comma}",

@@ -8,8 +8,8 @@ use viahop::ffi::{viahop_free_str, viahop_route_file, viahop_route_str, viahop_v
 use viahop::geometry::Point;
 use viahop::optimize::{optimize_routes, route_wirelength};
 use viahop::{
-    check_drc, parse_ses, route, route_with_checkpoint, write_ses, Board, DsnDesign, NetRoute,
-    RouteReport, RouteScore, RoutedSegment, RoutedVia, RouterConfig, UnroutedKind,
+    Board, DsnDesign, NetRoute, RouteReport, RouteScore, RoutedSegment, RoutedVia, RouterConfig,
+    UnroutedKind, check_drc, parse_ses, route, route_with_checkpoint, write_ses,
 };
 
 fn two_layer_crossing_dsn() -> &'static str {
@@ -238,7 +238,12 @@ fn routes_two_layer_crossing_around_keepout_with_zero_drc() {
     assert_eq!(res.stats.unconnected_pairs, 0);
     assert!(res.stats.total_wirelength_um > 0.0);
     let drc = check_drc(&res.board, &res.routes);
-    assert_eq!(drc.violations.len(), 0, "DRC violations: {:?}", drc.violations);
+    assert_eq!(
+        drc.violations.len(),
+        0,
+        "DRC violations: {:?}",
+        drc.violations
+    );
 
     let ses = write_ses(&design, &res);
     assert!(ses.contains("(session crossing"));
@@ -282,9 +287,18 @@ fn dense_040mm_bga_routes_inner_ball_via_pofv() {
     assert_eq!(res.stats.routable_nets, 9);
     assert_eq!(res.stats.routed_nets, 9, "all 9 BGA balls must route");
     assert_eq!(res.stats.unconnected_pairs, 0);
-    assert!(res.stats.dense_bga_pads >= 1, "must detect dense inner BGA pads");
-    assert!(res.stats.pofv_capable_pads >= 9, "all 9 BGA pads should allow centered POFV");
-    assert_eq!(res.stats.drc_violations, 0, "POFV vias must produce 0 DRC violations");
+    assert!(
+        res.stats.dense_bga_pads >= 1,
+        "must detect dense inner BGA pads"
+    );
+    assert!(
+        res.stats.pofv_capable_pads >= 9,
+        "all 9 BGA pads should allow centered POFV"
+    );
+    assert_eq!(
+        res.stats.drc_violations, 0,
+        "POFV vias must produce 0 DRC violations"
+    );
 }
 
 #[test]
@@ -308,7 +322,9 @@ fn applies_external_rules_file_and_mil_units() {
     )"#;
     let mut design = DsnDesign::parse(mil_dsn).unwrap();
     assert!((design.default_rules.width.unwrap() - 254.0).abs() < 1e-3);
-    design.apply_rules_file("(rules (rule (width 8) (clearance 8)))").unwrap();
+    design
+        .apply_rules_file("(rules (rule (width 8) (clearance 8)))")
+        .unwrap();
     assert!((design.default_rules.width.unwrap() - 203.2).abs() < 1e-3);
     let res = route(&design, &RouterConfig::default()).unwrap();
     assert_eq!(res.stats.routed_nets, 1);
@@ -397,12 +413,42 @@ fn optimizer_pulls_tight_and_eliminates_redundant_via_pair() {
     let mut routes = vec![NetRoute {
         net_id: 0,
         segments: vec![
-            RoutedSegment { layer: 0, a: Point::new(1500.0, 3000.0), b: Point::new(2500.0, 3000.0), width: 200.0 },
-            RoutedSegment { layer: 0, a: Point::new(2500.0, 3000.0), b: Point::new(2500.0, 4200.0), width: 200.0 },
-            RoutedSegment { layer: 0, a: Point::new(2500.0, 4200.0), b: Point::new(3500.0, 4200.0), width: 200.0 },
-            RoutedSegment { layer: 0, a: Point::new(3500.0, 4200.0), b: Point::new(3500.0, 3000.0), width: 200.0 },
-            RoutedSegment { layer: 1, a: Point::new(3500.0, 3000.0), b: Point::new(6500.0, 3000.0), width: 200.0 },
-            RoutedSegment { layer: 0, a: Point::new(6500.0, 3000.0), b: Point::new(8500.0, 3000.0), width: 200.0 },
+            RoutedSegment {
+                layer: 0,
+                a: Point::new(1500.0, 3000.0),
+                b: Point::new(2500.0, 3000.0),
+                width: 200.0,
+            },
+            RoutedSegment {
+                layer: 0,
+                a: Point::new(2500.0, 3000.0),
+                b: Point::new(2500.0, 4200.0),
+                width: 200.0,
+            },
+            RoutedSegment {
+                layer: 0,
+                a: Point::new(2500.0, 4200.0),
+                b: Point::new(3500.0, 4200.0),
+                width: 200.0,
+            },
+            RoutedSegment {
+                layer: 0,
+                a: Point::new(3500.0, 4200.0),
+                b: Point::new(3500.0, 3000.0),
+                width: 200.0,
+            },
+            RoutedSegment {
+                layer: 1,
+                a: Point::new(3500.0, 3000.0),
+                b: Point::new(6500.0, 3000.0),
+                width: 200.0,
+            },
+            RoutedSegment {
+                layer: 0,
+                a: Point::new(6500.0, 3000.0),
+                b: Point::new(8500.0, 3000.0),
+                width: 200.0,
+            },
         ],
         vias: vec![
             RoutedVia {
@@ -427,9 +473,20 @@ fn optimizer_pulls_tight_and_eliminates_redundant_via_pair() {
     optimize_routes(&board, &mut routes);
     let after_len = route_wirelength(&routes[0]);
 
-    assert_eq!(routes[0].vias.len(), 0, "redundant via pair must be eliminated");
-    assert!(after_len < before_len - 1000.0, "pull-tight should shorten staircase detour");
-    assert_eq!(routes[0].segments.len(), 1, "straight open route should collapse to 1 segment");
+    assert_eq!(
+        routes[0].vias.len(),
+        0,
+        "redundant via pair must be eliminated"
+    );
+    assert!(
+        after_len < before_len - 1000.0,
+        "pull-tight should shorten staircase detour"
+    );
+    assert_eq!(
+        routes[0].segments.len(),
+        1,
+        "straight open route should collapse to 1 segment"
+    );
     assert_eq!(check_drc(&board, &routes).violations.len(), 0);
 }
 
@@ -445,7 +502,10 @@ fn multi_start_skips_when_perfect_and_explores_when_unrouted() {
         },
     )
     .unwrap();
-    assert_eq!(easy_res.stats.starts_run, 1, "perfect start 0 must skip extra starts");
+    assert_eq!(
+        easy_res.stats.starts_run, 1,
+        "perfect start 0 must skip extra starts"
+    );
 
     let hard = DsnDesign::parse(blocked_and_open_dsn()).unwrap();
     let hard_res = route(
@@ -458,7 +518,10 @@ fn multi_start_skips_when_perfect_and_explores_when_unrouted() {
         },
     )
     .unwrap();
-    assert_eq!(hard_res.stats.starts_run, 3, "unrouted start 0 should run all multi-start seeds");
+    assert_eq!(
+        hard_res.stats.starts_run, 3,
+        "unrouted start 0 should run all multi-start seeds"
+    );
     assert_eq!(hard_res.stats.routed_nets, 1);
     assert_eq!(hard_res.stats.unconnected_pairs, 1);
 }
@@ -474,10 +537,17 @@ fn checkpoint_callback_and_stop_flag() {
     .unwrap();
     assert_eq!(res.stats.routed_nets, 2);
     let recorded = scores.lock().unwrap();
-    assert!(!recorded.is_empty(), "checkpoint callback must fire on improvement");
+    assert!(
+        !recorded.is_empty(),
+        "checkpoint callback must fire on improvement"
+    );
     for w in recorded.windows(2) {
-        assert!(w[1].is_better_than(w[0]), "checkpoint scores must improve monotonically");
+        assert!(
+            w[1].is_better_than(w[0]),
+            "checkpoint scores must improve monotonically"
+        );
     }
+    drop(recorded);
 
     let stop = Arc::new(AtomicBool::new(true));
     let stopped_res = route(
@@ -525,8 +595,16 @@ fn report_and_diagnose_distinguishes_blocked_vs_congestion() {
 
     let report = RouteReport::build(&board, &empty_routes, stats, true);
     assert_eq!(report.unrouted.len(), 2);
-    let blocked = report.unrouted.iter().find(|u| u.net == "/Net/BLOCKED").unwrap();
-    let open = report.unrouted.iter().find(|u| u.net == "/Net/OPEN").unwrap();
+    let blocked = report
+        .unrouted
+        .iter()
+        .find(|u| u.net == "/Net/BLOCKED")
+        .unwrap();
+    let open = report
+        .unrouted
+        .iter()
+        .find(|u| u.net == "/Net/OPEN")
+        .unwrap();
     assert_eq!(blocked.diagnosis, Some(UnroutedKind::Blocked));
     assert_eq!(open.diagnosis, Some(UnroutedKind::Congestion));
 
@@ -585,7 +663,11 @@ fn c_abi_smoke_test() {
             err_buf.len(),
         );
         assert_eq!(rc2, 0);
-        assert!(std::fs::read_to_string(&tmp_out).unwrap().contains("(session crossing"));
+        assert!(
+            std::fs::read_to_string(&tmp_out)
+                .unwrap()
+                .contains("(session crossing")
+        );
         let _ = std::fs::remove_file(&tmp_in);
         let _ = std::fs::remove_file(&tmp_out);
     }
@@ -639,7 +721,11 @@ fn cli_flags_report_diagnose_and_initial_session() {
         ])
         .output()
         .unwrap();
-    assert!(out1.status.success(), "stderr: {}", String::from_utf8_lossy(&out1.stderr));
+    assert!(
+        out1.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out1.stderr)
+    );
     let stdout1 = String::from_utf8_lossy(&out1.stdout);
     assert!(stdout1.contains("\"routable_nets\":1"));
     assert!(stdout1.contains("\"routed_nets\":1"));
@@ -657,7 +743,11 @@ fn cli_flags_report_diagnose_and_initial_session() {
         ])
         .output()
         .unwrap();
-    assert!(out2.status.success(), "stderr: {}", String::from_utf8_lossy(&out2.stderr));
+    assert!(
+        out2.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out2.stderr)
+    );
     assert!(String::from_utf8_lossy(&out2.stdout).contains("\"routed_nets\":2"));
     let ses = std::fs::read_to_string(&tmp_out).unwrap();
     assert!(ses.contains("(net /Net/A"));
@@ -681,7 +771,11 @@ fn cli_flags_report_diagnose_and_initial_session() {
         ])
         .output()
         .unwrap();
-    assert!(out3.status.success(), "stderr: {}", String::from_utf8_lossy(&out3.stderr));
+    assert!(
+        out3.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out3.stderr)
+    );
     let report_json = std::fs::read_to_string(&tmp_report).unwrap();
     assert!(report_json.contains("/Net/BLOCKED"));
     assert!(report_json.contains("\"diagnosis\":\"blocked\""));
@@ -690,7 +784,14 @@ fn cli_flags_report_diagnose_and_initial_session() {
     assert!(ver_out.status.success());
     assert!(String::from_utf8_lossy(&ver_out.stdout).contains("viahop"));
 
-    for p in [&tmp_in, &tmp_partial, &tmp_out, &tmp_diag_in, &tmp_diag_out, &tmp_report] {
+    for p in [
+        &tmp_in,
+        &tmp_partial,
+        &tmp_out,
+        &tmp_diag_in,
+        &tmp_diag_out,
+        &tmp_report,
+    ] {
         let _ = std::fs::remove_file(p);
     }
 }

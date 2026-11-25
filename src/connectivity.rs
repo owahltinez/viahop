@@ -6,7 +6,7 @@ use crate::board::{Board, NetRoute};
 use crate::drc::check_drc;
 use crate::geometry::{point_to_segment_dist, segment_to_segment_dist};
 use crate::optimize::route_wirelength;
-use crate::router::{uf_find, Terminal};
+use crate::router::{Terminal, uf_find};
 
 /// Comparable quality metric for choosing the best board across passes and multi-start seeds.
 #[derive(Debug, Clone, Copy, PartialEq)]

@@ -7,11 +7,13 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::astar::{astar_connect, unpack_node, PassParams, SearchScratch};
+use crate::astar::{PassParams, SearchScratch, astar_connect, unpack_node};
 use crate::board::{Board, NetRoute, Pad, RoutedSegment, RoutedVia};
-use crate::connectivity::{count_all_unconnected, count_unconnected_pairs, score_routes, RouteScore};
-use crate::drc::{check_drc, DrcReport};
-use crate::fanout::{analyze_fanout, FanoutPlan};
+use crate::connectivity::{
+    RouteScore, count_all_unconnected, count_unconnected_pairs, score_routes,
+};
+use crate::drc::{DrcReport, check_drc};
+use crate::fanout::{FanoutPlan, analyze_fanout};
 use crate::geometry::Point;
 use crate::grid::{NetFootprint, RoutingGrid};
 use crate::optimize::route_wirelength;
@@ -145,13 +147,14 @@ where
     let global_best = Mutex::new(RouteScore::WORST);
     let notify_best = |routes: &[NetRoute], score: RouteScore| {
         if let Ok(mut guard) = global_best.lock()
-            && score.is_better_than(*guard) {
-                *guard = score;
-                drop(guard);
-                if let Some(cb) = on_best {
-                    cb(routes, score);
-                }
+            && score.is_better_than(*guard)
+        {
+            *guard = score;
+            drop(guard);
+            if let Some(cb) = on_best {
+                cb(routes, score);
             }
+        }
     };
 
     // Start 0 uses the canonical net ordering; boards routed cleanly pay zero multi-start cost.
@@ -180,7 +183,8 @@ where
         let worker_count = config.threads.max(1).min(remaining);
         let next_seed = AtomicUsize::new(1);
         let found_perfect = AtomicBool::new(false);
-        let collected: Mutex<Vec<(usize, StartOutcome)>> = Mutex::new(Vec::with_capacity(remaining));
+        let collected: Mutex<Vec<(usize, StartOutcome)>> =
+            Mutex::new(Vec::with_capacity(remaining));
 
         std::thread::scope(|s| {
             for _ in 0..worker_count {
@@ -192,33 +196,35 @@ where
                 let next_ref = &next_seed;
                 let perfect_ref = &found_perfect;
                 let collected_ref = &collected;
-                s.spawn(move || loop {
-                    if perfect_ref.load(AtomicOrdering::Relaxed)
-                        || is_cancelled(deadline, config.stop_flag.as_ref(), None)
-                    {
-                        break;
-                    }
-                    let seed = next_ref.fetch_add(1, AtomicOrdering::SeqCst);
-                    if seed >= total_starts {
-                        break;
-                    }
-                    let order = seeded_net_order(canon_ref, seed);
-                    let res = run_single_start(
-                        board,
-                        base_ref,
-                        comps_ref,
-                        routable_ref,
-                        &order,
-                        config,
-                        deadline,
-                        notify_ref,
-                        Some(perfect_ref),
-                    );
-                    if res.score.is_perfect() {
-                        perfect_ref.store(true, AtomicOrdering::Relaxed);
-                    }
-                    if let Ok(mut guard) = collected_ref.lock() {
-                        guard.push((seed, res));
+                s.spawn(move || {
+                    loop {
+                        if perfect_ref.load(AtomicOrdering::Relaxed)
+                            || is_cancelled(deadline, config.stop_flag.as_ref(), None)
+                        {
+                            break;
+                        }
+                        let seed = next_ref.fetch_add(1, AtomicOrdering::SeqCst);
+                        if seed >= total_starts {
+                            break;
+                        }
+                        let order = seeded_net_order(canon_ref, seed);
+                        let res = run_single_start(
+                            board,
+                            base_ref,
+                            comps_ref,
+                            routable_ref,
+                            &order,
+                            config,
+                            deadline,
+                            notify_ref,
+                            Some(perfect_ref),
+                        );
+                        if res.score.is_perfect() {
+                            perfect_ref.store(true, AtomicOrdering::Relaxed);
+                        }
+                        if let Ok(mut guard) = collected_ref.lock() {
+                            guard.push((seed, res));
+                        }
                     }
                 });
             }
@@ -237,10 +243,18 @@ where
     let mut routes = best_outcome.routes;
     let final_drc = check_drc(board, &routes);
     if std::env::var_os("VIAHOP_DEBUG").is_some() {
-        log_unconnected_debug(board, &base_grid, &fanout, &net_components, &routable_nets, &routes);
+        log_unconnected_debug(
+            board,
+            &base_grid,
+            &fanout,
+            &net_components,
+            &routable_nets,
+            &routes,
+        );
     }
 
-    let unconnected_pairs = count_all_unconnected(board, &net_components, &mut routes, &routable_nets);
+    let unconnected_pairs =
+        count_all_unconnected(board, &net_components, &mut routes, &routable_nets);
     let routed_nets = routable_nets
         .iter()
         .filter(|&&nid| routes[nid].unconnected_pairs == 0)
@@ -369,9 +383,7 @@ where
                 })
                 .collect();
             if dirty.is_empty() || pass == 0 || pass % 3 == 0 {
-                let drc = last_drc
-                    .take()
-                    .unwrap_or_else(|| check_drc(board, &routes));
+                let drc = last_drc.take().unwrap_or_else(|| check_drc(board, &routes));
                 if drc.violations.is_empty() && dirty.is_empty() {
                     last_drc = Some(drc);
                     break;
@@ -410,7 +422,14 @@ where
                 break;
             }
             grid.remove_footprint(&footprints[nid]);
-            let nr = route_single_net(board, &grid, &net_components[nid], nid, &params, &mut scratch);
+            let nr = route_single_net(
+                board,
+                &grid,
+                &net_components[nid],
+                nid,
+                &params,
+                &mut scratch,
+            );
             footprints[nid] = grid.add_footprint(board, &nr);
             routes[nid] = nr;
         }
@@ -468,13 +487,11 @@ where
                 .filter(|&nid| routes[nid].unconnected_pairs > 0)
                 .collect();
             let drc_cur = last_drc.take().unwrap_or_else(|| check_drc(board, &routes));
-            let cong_nets: Vec<usize> = net_order
+            let any_cong = net_order
                 .iter()
-                .copied()
-                .filter(|&nid| grid.has_conflict(&footprints[nid]))
-                .collect();
+                .any(|&nid| grid.has_conflict(&footprints[nid]));
 
-            if unconn_nets.is_empty() && drc_cur.violations.is_empty() && cong_nets.is_empty() {
+            if unconn_nets.is_empty() && drc_cur.violations.is_empty() && !any_cong {
                 break;
             }
 
@@ -709,21 +726,22 @@ fn route_single_net(
         let last_node = *path.last().unwrap();
 
         if !node_in_extra(first_node, src_extra, n2d, grid.cols)
-            && let Some((exact, via_opt, pad_layer)) = match_anchor(&src_entries, first_node) {
-                emit_landing(
-                    board,
-                    grid,
-                    net_id,
-                    first_node,
-                    exact,
-                    via_opt,
-                    pad_layer,
-                    true,
-                    rules,
-                    &mut via_positions,
-                    &mut nr,
-                );
-            }
+            && let Some((exact, via_opt, pad_layer)) = match_anchor(&src_entries, first_node)
+        {
+            emit_landing(
+                board,
+                grid,
+                net_id,
+                first_node,
+                exact,
+                via_opt,
+                pad_layer,
+                true,
+                rules,
+                &mut via_positions,
+                &mut nr,
+            );
+        }
 
         // Coalesce consecutive collinear grid steps into single segments immediately during routing.
         let mut active_run: Option<(usize, Point, (isize, isize))> = None;
@@ -735,14 +753,15 @@ fn route_single_net(
             let p2 = grid.pt_of(gx2, gy2);
             if sl1 != sl2 {
                 if let Some((layer, start_pt, _)) = active_run.take()
-                    && start_pt.dist(run_end) > 0.5 {
-                        nr.segments.push(RoutedSegment {
-                            layer,
-                            a: start_pt,
-                            b: run_end,
-                            width: rules.width,
-                        });
-                    }
+                    && start_pt.dist(run_end) > 0.5
+                {
+                    nr.segments.push(RoutedSegment {
+                        layer,
+                        a: start_pt,
+                        b: run_end,
+                        width: rules.width,
+                    });
+                }
                 push_unique_via(board, net_id, &mut via_positions, &mut nr, p1, rules);
             } else {
                 let bl = grid.sig_layers[sl1];
@@ -753,14 +772,15 @@ fn route_single_net(
                     }
                     _ => {
                         if let Some((layer, start_pt, _)) = active_run.take()
-                            && start_pt.dist(run_end) > 0.5 {
-                                nr.segments.push(RoutedSegment {
-                                    layer,
-                                    a: start_pt,
-                                    b: run_end,
-                                    width: rules.width,
-                                });
-                            }
+                            && start_pt.dist(run_end) > 0.5
+                        {
+                            nr.segments.push(RoutedSegment {
+                                layer,
+                                a: start_pt,
+                                b: run_end,
+                                width: rules.width,
+                            });
+                        }
                         active_run = Some((bl, p1, dir));
                         run_end = p2;
                     }
@@ -768,31 +788,33 @@ fn route_single_net(
             }
         }
         if let Some((layer, start_pt, _)) = active_run.take()
-            && start_pt.dist(run_end) > 0.5 {
-                nr.segments.push(RoutedSegment {
-                    layer,
-                    a: start_pt,
-                    b: run_end,
-                    width: rules.width,
-                });
-            }
+            && start_pt.dist(run_end) > 0.5
+        {
+            nr.segments.push(RoutedSegment {
+                layer,
+                a: start_pt,
+                b: run_end,
+                width: rules.width,
+            });
+        }
 
         if !node_in_extra(last_node, dst_extra, n2d, grid.cols)
-            && let Some((exact, via_opt, pad_layer)) = match_anchor(&dst_entries, last_node) {
-                emit_landing(
-                    board,
-                    grid,
-                    net_id,
-                    last_node,
-                    exact,
-                    via_opt,
-                    pad_layer,
-                    false,
-                    rules,
-                    &mut via_positions,
-                    &mut nr,
-                );
-            }
+            && let Some((exact, via_opt, pad_layer)) = match_anchor(&dst_entries, last_node)
+        {
+            emit_landing(
+                board,
+                grid,
+                net_id,
+                last_node,
+                exact,
+                via_opt,
+                pad_layer,
+                false,
+                rules,
+                &mut via_positions,
+                &mut nr,
+            );
+        }
 
         let mut merged = std::mem::take(&mut comp_nodes[rb]);
         comp_nodes[ra].append(&mut merged);
@@ -923,8 +945,9 @@ pub(crate) fn build_net_components(
         if i >= pad_count && !comp_map.contains_key(&root) {
             continue;
         }
-        let entries =
-            compute_terminal_entries(board, grid, fanout, net_id, *pt, layers, *pad_opt, &mut sbuf);
+        let entries = compute_terminal_entries(
+            board, grid, fanout, net_id, *pt, layers, *pad_opt, &mut sbuf,
+        );
         comp_map.entry(root).or_default().push(Terminal {
             exact: *pt,
             pad_id: *pad_opt,
@@ -1116,8 +1139,7 @@ fn seeded_net_order(canonical: &[usize], seed: usize) -> Vec<usize> {
         order.reverse();
         return order;
     }
-    let mut state = 0x9E37_79B9_7F4A_7C15_u64
-        ^ (seed as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    let mut state = 0x9E37_79B9_7F4A_7C15_u64 ^ (seed as u64).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     for i in (1..order.len()).rev() {
         state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut z = state;
@@ -1150,9 +1172,10 @@ fn pads_physically_touch(a: &Pad, b: &Pad) -> bool {
     }
     for &(la, ref sa) in &a.layer_shapes {
         if let Some(sb) = b.shape_on_layer(la)
-            && (sa.dist_to_circle(b.center, 1.0) <= 0.0 || sb.dist_to_circle(a.center, 1.0) <= 0.0) {
-                return true;
-            }
+            && (sa.dist_to_circle(b.center, 1.0) <= 0.0 || sb.dist_to_circle(a.center, 1.0) <= 0.0)
+        {
+            return true;
+        }
     }
     false
 }

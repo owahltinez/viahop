@@ -5,7 +5,7 @@ use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int};
 use std::ptr;
 
-use crate::{route, write_ses, DsnDesign, RouterConfig};
+use crate::{DsnDesign, RouterConfig, route, write_ses};
 
 static VERSION_CSTR: &[u8] = concat!(env!("CARGO_PKG_VERSION"), "\0").as_bytes();
 
@@ -149,7 +149,11 @@ fn build_config(
         }
     }
     RouterConfig {
-        max_passes: if max_passes > 0 { max_passes as usize } else { 20 },
+        max_passes: if max_passes > 0 {
+            max_passes as usize
+        } else {
+            20
+        },
         ignored_nets,
         via_at_smd: if via_at_smd > 0 {
             Some(true)

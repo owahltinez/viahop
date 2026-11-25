@@ -9,8 +9,8 @@ use std::process::ExitCode;
 use std::sync::Mutex;
 
 use viahop::{
-    parse_ses, route_board_with_checkpoint, ses, signal, Board, DsnDesign, RouteReport,
-    RouteScore, RouterConfig,
+    Board, DsnDesign, RouteReport, RouteScore, RouterConfig, parse_ses,
+    route_board_with_checkpoint, ses, signal,
 };
 
 struct CliArgs {

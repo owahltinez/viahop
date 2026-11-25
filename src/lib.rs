@@ -18,10 +18,10 @@ pub mod signal;
 
 pub use board::{Board, NetRoute, RoutedSegment, RoutedVia};
 pub use connectivity::RouteScore;
-pub use drc::{check_drc, DrcReport, DrcViolation};
+pub use drc::{DrcReport, DrcViolation, check_drc};
 pub use dsn::DsnDesign;
 pub use report::{RouteReport, UnroutedConnection, UnroutedKind, ViolationDetail};
-pub use router::{route_board, route_board_with_checkpoint, RouteStats, RouterConfig};
+pub use router::{RouteStats, RouterConfig, route_board, route_board_with_checkpoint};
 pub use ses::parse_ses;
 
 /// Complete result of routing a parsed Specctra DSN design.

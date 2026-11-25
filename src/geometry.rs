@@ -1,7 +1,5 @@
 //! Exact 2D computational geometry for PCB clearance, shapes, and transforms.
 
-use std::f64::consts::PI;
-
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Point {
     pub x: f64,
@@ -57,7 +55,12 @@ impl BBox {
             max_x = max_x.max(p.x);
             max_y = max_y.max(p.y);
         }
-        Self::new(min_x - margin, min_y - margin, max_x + margin, max_y + margin)
+        Self::new(
+            min_x - margin,
+            min_y - margin,
+            max_x + margin,
+            max_y + margin,
+        )
     }
 
     pub fn expand(self, margin: f64) -> Self {
@@ -89,11 +92,21 @@ impl BBox {
 /// Exact copper or keepout geometry on a single PCB layer (units: micrometers).
 #[derive(Debug, Clone)]
 pub enum Shape {
-    Circle { center: Point, radius: f64 },
+    Circle {
+        center: Point,
+        radius: f64,
+    },
     /// Swept line segment (covers Specctra `path` pad shapes and trace segments).
-    Capsule { a: Point, b: Point, radius: f64 },
+    Capsule {
+        a: Point,
+        b: Point,
+        radius: f64,
+    },
     /// Closed polygon (covers `rect`, rotated `rect`, and arbitrary `polygon`).
-    Poly { verts: Vec<Point>, bbox: BBox },
+    Poly {
+        verts: Vec<Point>,
+        bbox: BBox,
+    },
 }
 
 impl Shape {
@@ -138,9 +151,7 @@ impl Shape {
                 center: c,
                 radius: r,
             } => c.dist(center) - r - radius,
-            Self::Capsule { a, b, radius: r } => {
-                point_to_segment_dist(center, *a, *b) - r - radius
-            }
+            Self::Capsule { a, b, radius: r } => point_to_segment_dist(center, *a, *b) - r - radius,
             Self::Poly { verts, .. } => point_to_polygon_dist(center, verts) - radius,
         }
     }
@@ -188,8 +199,7 @@ impl Shape {
 pub fn transform_point(p: Point, flip_x: bool, rot_deg: f64, origin: Point) -> Point {
     let lx = if flip_x { -p.x } else { p.x };
     let ly = p.y;
-    let rad = rot_deg * PI / 180.0;
-    let (s, c) = rad.sin_cos();
+    let (s, c) = rot_deg.to_radians().sin_cos();
     // Snap exact right-angle trig to avoid tiny floating-point drift on 0/90/180/270.
     let (s, c) = snap_trig(s, c);
     Point::new(origin.x + lx * c - ly * s, origin.y + lx * s + ly * c)
@@ -227,7 +237,8 @@ pub fn point_to_segment_dist(p: Point, a: Point, b: Point) -> f64 {
 }
 
 pub fn segments_intersect(a1: Point, a2: Point, b1: Point, b2: Point) -> bool {
-    let orient = |p: Point, q: Point, r: Point| (q.x - p.x) * (r.y - p.y) - (q.y - p.y) * (r.x - p.x);
+    let orient =
+        |p: Point, q: Point, r: Point| (q.x - p.x) * (r.y - p.y) - (q.y - p.y) * (r.x - p.x);
     let on_seg = |p: Point, q: Point, r: Point| {
         q.x <= p.x.max(r.x) + 1e-9
             && q.x >= p.x.min(r.x) - 1e-9
@@ -349,12 +360,22 @@ mod tests {
     #[test]
     fn back_side_transform_matches_kicad() {
         // R27: back 180 at (20400, -12200), local pin1=(-510, 0) -> world (19890, -12200)
-        let p = transform_point(Point::new(-510.0, 0.0), true, 180.0, Point::new(20400.0, -12200.0));
+        let p = transform_point(
+            Point::new(-510.0, 0.0),
+            true,
+            180.0,
+            Point::new(20400.0, -12200.0),
+        );
         assert!((p.x - 19890.0).abs() < 1e-6);
         assert!((p.y + 12200.0).abs() < 1e-6);
 
         // R35: back 270 at (30200, -30500), local pin1=(-510, 0) -> world (30200, -31010)
-        let p2 = transform_point(Point::new(-510.0, 0.0), true, 270.0, Point::new(30200.0, -30500.0));
+        let p2 = transform_point(
+            Point::new(-510.0, 0.0),
+            true,
+            270.0,
+            Point::new(30200.0, -30500.0),
+        );
         assert!((p2.x - 30200.0).abs() < 1e-6);
         assert!((p2.y + 31010.0).abs() < 1e-6);
     }

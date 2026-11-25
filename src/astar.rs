@@ -264,7 +264,9 @@ pub(crate) fn astar_connect(
                 continue;
             }
             let skip_start_pofv = scratch.parent[idx] == u32::MAX
-                && src_anchors.iter().any(|&(n, _, vo, _)| n == node && vo.is_some());
+                && src_anchors
+                    .iter()
+                    .any(|&(n, _, vo, _)| n == node && vo.is_some());
             if skip_start_pofv {
                 continue;
             }
