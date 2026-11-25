@@ -23,6 +23,7 @@ pub fn install_signal_handlers() {
     }
     #[cfg(windows)]
     unsafe {
+        #[link(name = "kernel32")]
         extern "system" {
             fn SetConsoleCtrlHandler(
                 handler: Option<unsafe extern "system" fn(u32) -> i32>,

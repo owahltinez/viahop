@@ -1,0 +1,104 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            bin: viahop
+            lib: libviahop.so
+            archive: tar.gz
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            bin: viahop
+            lib: libviahop.so
+            archive: tar.gz
+          - target: aarch64-apple-darwin
+            os: macos-14
+            bin: viahop
+            lib: libviahop.dylib
+            archive: tar.gz
+          - target: x86_64-apple-darwin
+            os: macos-14
+            bin: viahop
+            lib: libviahop.dylib
+            archive: tar.gz
+            cross: true
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            bin: viahop.exe
+            lib: viahop.dll
+            extra_lib: viahop.dll.lib
+            archive: zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Run tests
+        if: ${{ !matrix.cross }}
+        run: cargo test --release --target ${{ matrix.target }}
+      - name: Build release
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Package Unix archive
+        if: ${{ matrix.archive == 'tar.gz' }}
+        shell: bash
+        run: |
+          stage="viahop-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir -p "$stage/include"
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "$stage/"
+          cp "target/${{ matrix.target }}/release/${{ matrix.lib }}" "$stage/"
+          cp include/viahop.h "$stage/include/"
+          cp LICENSE README.md "$stage/"
+          tar -czf "${stage}.tar.gz" "$stage"
+      - name: Package Windows archive
+        if: ${{ matrix.archive == 'zip' }}
+        shell: pwsh
+        run: |
+          $stage = "viahop-$($env:GITHUB_REF_NAME)-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path "$stage/include" | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.bin }}" "$stage/"
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.lib }}" "$stage/"
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.extra_lib }}" "$stage/"
+          Copy-Item "include/viahop.h" "$stage/include/"
+          Copy-Item "LICENSE", "README.md" "$stage/"
+          Compress-Archive -Path "$stage" -DestinationPath "$stage.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: viahop-${{ matrix.target }}
+          path: viahop-${{ github.ref_name }}-${{ matrix.target }}.${{ matrix.archive }}
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum viahop-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "viahop $GITHUB_REF_NAME" \
+            --generate-notes \
+            dist/viahop-* dist/SHA256SUMS.txt

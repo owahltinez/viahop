@@ -566,11 +566,12 @@ fn c_abi_smoke_test() {
         viahop_free_str(out_ses);
         viahop_free_str(out_json);
 
-        let tmp_in = "/tmp/viahop_ffi_in.dsn";
-        let tmp_out = "/tmp/viahop_ffi_out.ses";
-        std::fs::write(tmp_in, two_layer_crossing_dsn()).unwrap();
-        let in_c = CString::new(tmp_in).unwrap();
-        let out_c = CString::new(tmp_out).unwrap();
+        let tmp_dir = std::env::temp_dir();
+        let tmp_in = tmp_dir.join("viahop_ffi_in.dsn");
+        let tmp_out = tmp_dir.join("viahop_ffi_out.ses");
+        std::fs::write(&tmp_in, two_layer_crossing_dsn()).unwrap();
+        let in_c = CString::new(tmp_in.to_str().unwrap()).unwrap();
+        let out_c = CString::new(tmp_out.to_str().unwrap()).unwrap();
         let mut err_buf = [0i8; 256];
         let rc2 = viahop_route_file(
             in_c.as_ptr(),
@@ -584,9 +585,9 @@ fn c_abi_smoke_test() {
             err_buf.len(),
         );
         assert_eq!(rc2, 0);
-        assert!(std::fs::read_to_string(tmp_out).unwrap().contains("(session crossing"));
-        let _ = std::fs::remove_file(tmp_in);
-        let _ = std::fs::remove_file(tmp_out);
+        assert!(std::fs::read_to_string(&tmp_out).unwrap().contains("(session crossing"));
+        let _ = std::fs::remove_file(&tmp_in);
+        let _ = std::fs::remove_file(&tmp_out);
     }
 }
 
@@ -607,22 +608,23 @@ fn parses_malformed_dsn_with_stray_closing_paren() {
 #[test]
 fn cli_flags_report_diagnose_and_initial_session() {
     let bin = env!("CARGO_BIN_EXE_viahop");
-    let tmp_in = "/tmp/viahop_cli_in.dsn";
-    let tmp_partial = "/tmp/viahop_cli_partial.ses";
-    let tmp_out = "/tmp/viahop_cli_out.ses";
-    let tmp_diag_in = "/tmp/viahop_cli_diag.dsn";
-    let tmp_diag_out = "/tmp/viahop_cli_diag.ses";
-    let tmp_report = "/tmp/viahop_cli_report.json";
+    let tmp_dir = std::env::temp_dir();
+    let tmp_in = tmp_dir.join("viahop_cli_in.dsn");
+    let tmp_partial = tmp_dir.join("viahop_cli_partial.ses");
+    let tmp_out = tmp_dir.join("viahop_cli_out.ses");
+    let tmp_diag_in = tmp_dir.join("viahop_cli_diag.dsn");
+    let tmp_diag_out = tmp_dir.join("viahop_cli_diag.ses");
+    let tmp_report = tmp_dir.join("viahop_cli_report.json");
 
-    std::fs::write(tmp_in, two_layer_crossing_dsn()).unwrap();
+    std::fs::write(&tmp_in, two_layer_crossing_dsn()).unwrap();
 
     // 1. Route only /Net/A into a checkpoint SES.
     let out1 = std::process::Command::new(bin)
         .args([
             "-de",
-            tmp_in,
+            tmp_in.to_str().unwrap(),
             "-do",
-            tmp_partial,
+            tmp_partial.to_str().unwrap(),
             "-mp",
             "10",
             "-inc",
@@ -645,42 +647,42 @@ fn cli_flags_report_diagnose_and_initial_session() {
     // 2. Resume with --initial-session and route the full board.
     let out2 = std::process::Command::new(bin)
         .args([
-            "-de",
-            tmp_in,
-            "-do",
-            tmp_out,
+            "-i",
+            tmp_in.to_str().unwrap(),
+            "-o",
+            tmp_out.to_str().unwrap(),
             "--initial-session",
-            tmp_partial,
+            tmp_partial.to_str().unwrap(),
             "--json-summary",
         ])
         .output()
         .unwrap();
     assert!(out2.status.success(), "stderr: {}", String::from_utf8_lossy(&out2.stderr));
     assert!(String::from_utf8_lossy(&out2.stdout).contains("\"routed_nets\":2"));
-    let ses = std::fs::read_to_string(tmp_out).unwrap();
+    let ses = std::fs::read_to_string(&tmp_out).unwrap();
     assert!(ses.contains("(net /Net/A"));
     assert!(ses.contains("(net /Net/B"));
 
     // 3. Run --report + --diagnose on blocked board.
-    std::fs::write(tmp_diag_in, blocked_and_open_dsn()).unwrap();
+    std::fs::write(&tmp_diag_in, blocked_and_open_dsn()).unwrap();
     let out3 = std::process::Command::new(bin)
         .args([
-            "-de",
-            tmp_diag_in,
-            "-do",
-            tmp_diag_out,
+            "-i",
+            tmp_diag_in.to_str().unwrap(),
+            "-o",
+            tmp_diag_out.to_str().unwrap(),
             "-mp",
             "2",
             "--multi-start=2",
             "--report",
-            tmp_report,
+            tmp_report.to_str().unwrap(),
             "--diagnose",
-            "-dl",
+            "-q",
         ])
         .output()
         .unwrap();
     assert!(out3.status.success(), "stderr: {}", String::from_utf8_lossy(&out3.stderr));
-    let report_json = std::fs::read_to_string(tmp_report).unwrap();
+    let report_json = std::fs::read_to_string(&tmp_report).unwrap();
     assert!(report_json.contains("/Net/BLOCKED"));
     assert!(report_json.contains("\"diagnosis\":\"blocked\""));
 
@@ -688,7 +690,7 @@ fn cli_flags_report_diagnose_and_initial_session() {
     assert!(ver_out.status.success());
     assert!(String::from_utf8_lossy(&ver_out.stdout).contains("viahop"));
 
-    for p in [tmp_in, tmp_partial, tmp_out, tmp_diag_in, tmp_diag_out, tmp_report] {
+    for p in [&tmp_in, &tmp_partial, &tmp_out, &tmp_diag_in, &tmp_diag_out, &tmp_report] {
         let _ = std::fs::remove_file(p);
     }
 }
