@@ -8,12 +8,31 @@ use crate::grid::RoutingGrid;
 
 const SQRT2: f32 = std::f32::consts::SQRT_2;
 
+/// Terminal entry point passed into A* with optional via landing and layer-preference bias.
+#[derive(Clone, Copy)]
+pub(crate) struct Anchor {
+    pub(crate) node: u32,
+    pub(crate) exact: Point,
+    pub(crate) via_pos: Option<Point>,
+    pub(crate) pad_layer: usize,
+    pub(crate) bias: f32,
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct PassParams {
     pub(crate) present_factor: f32,
     pub(crate) h_weight: f32,
     pub(crate) strict_mode: bool,
     pub(crate) max_expansions: usize,
+}
+
+/// Inclusive grid-coordinate bounding box used to clip local A* expansions.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SearchBounds {
+    pub(crate) min_gx: usize,
+    pub(crate) max_gx: usize,
+    pub(crate) min_gy: usize,
+    pub(crate) max_gy: usize,
 }
 
 /// Reusable A* scratch buffers reset in O(1) via generation counters.
@@ -94,13 +113,14 @@ pub(crate) fn unpack_node(node: u32, n2d: usize, cols: usize) -> (usize, usize, 
 pub(crate) fn astar_connect(
     grid: &RoutingGrid,
     net_id: usize,
-    src_anchors: &[(u32, Point, Option<Point>, usize)],
+    src_anchors: &[Anchor],
     src_extra: &[(usize, usize, usize)],
-    dst_anchors: &[(u32, Point, Option<Point>, usize)],
+    dst_anchors: &[Anchor],
     dst_extra: &[(usize, usize, usize)],
     existing_vias: &[Point],
     min_via_dist: f64,
     params: &PassParams,
+    bounds: Option<SearchBounds>,
     scratch: &mut SearchScratch,
 ) -> Option<Vec<u32>> {
     scratch.next_search();
@@ -124,8 +144,8 @@ pub(crate) fn astar_connect(
         has_target = true;
     };
 
-    for &(node, _, _, _) in dst_anchors {
-        mark_target(node, true);
+    for a in dst_anchors {
+        mark_target(a.node, true);
     }
     let dst_sample_step = (dst_extra.len() / 16).max(1);
     for (i, &(sl, gx, gy)) in dst_extra.iter().enumerate() {
@@ -173,9 +193,9 @@ pub(crate) fn astar_connect(
         });
     };
 
-    for &(node, _, via_opt, _) in src_anchors {
-        let init_c = if via_opt.is_some() { 4.5 } else { 0.0 };
-        seed(node, init_c);
+    for a in src_anchors {
+        let base = if a.via_pos.is_some() { 4.5 } else { 0.0 };
+        seed(a.node, (base + a.bias).max(0.0));
     }
     let step_skip = (src_extra.len() / 64).max(1);
     for &(sl, gx, gy) in src_extra.iter().step_by(step_skip) {
@@ -196,8 +216,15 @@ pub(crate) fn astar_connect(
     let max_expansions = params.max_expansions;
     let mut expansions = 0usize;
     let via_base_cost = 6.5_f32;
-    let cols_i = cols as isize;
-    let rows_i = rows as isize;
+    let (min_x, max_x, min_y, max_y) = match bounds {
+        Some(b) => (
+            b.min_gx.min(cols - 1) as isize,
+            b.max_gx.min(cols - 1) as isize,
+            b.min_gy.min(rows - 1) as isize,
+            b.max_gy.min(rows - 1) as isize,
+        ),
+        None => (0, cols as isize - 1, 0, rows as isize - 1),
+    };
 
     while let Some(HeapNode { g, node, .. }) = scratch.heap.pop() {
         let idx = node as usize;
@@ -220,7 +247,7 @@ pub(crate) fn astar_connect(
         for &(dx, dy, dist, is_h, is_v) in &DIRS {
             let nx = gx as isize + dx;
             let ny = gy as isize + dy;
-            if nx < 0 || ny < 0 || nx >= cols_i || ny >= rows_i {
+            if nx < min_x || ny < min_y || nx > max_x || ny > max_y {
                 continue;
             }
             let nxu = nx as usize;
@@ -245,7 +272,12 @@ pub(crate) fn astar_connect(
             };
             let hist = grid.wire_hist[nidx];
             let cong_mult = (1.0 + occ as f32 * params.present_factor) * (1.0 + hist);
-            let ng = g + dist * dir_bias * cong_mult;
+            let target_pen = if is_target {
+                dst_anchor_bias(dst_anchors, nidx as u32)
+            } else {
+                0.0
+            };
+            let ng = g + dist * dir_bias * cong_mult + target_pen;
 
             if scratch.seen_gen[nidx] != search_gen || ng < scratch.g_score[nidx] {
                 scratch.seen_gen[nidx] = search_gen;
@@ -267,7 +299,7 @@ pub(crate) fn astar_connect(
             let skip_start_pofv = scratch.parent[idx] == u32::MAX
                 && src_anchors
                     .iter()
-                    .any(|&(n, _, vo, _)| n == node && vo.is_some());
+                    .any(|a| a.node == node && a.via_pos.is_some());
             if skip_start_pofv {
                 continue;
             }
@@ -302,7 +334,12 @@ pub(crate) fn astar_connect(
                     if params.strict_mode && wocc > 0 && !is_target {
                         continue;
                     }
-                    let ng = g + vcost + wocc as f32 * params.present_factor;
+                    let target_pen = if is_target {
+                        dst_anchor_bias(dst_anchors, nidx as u32)
+                    } else {
+                        0.0
+                    };
+                    let ng = g + vcost + wocc as f32 * params.present_factor + target_pen;
                     if scratch.seen_gen[nidx] != search_gen || ng < scratch.g_score[nidx] {
                         scratch.seen_gen[nidx] = search_gen;
                         scratch.g_score[nidx] = ng;
@@ -319,6 +356,19 @@ pub(crate) fn astar_connect(
     }
 
     None
+}
+
+fn dst_anchor_bias(dst_anchors: &[Anchor], node: u32) -> f32 {
+    let mut best = f32::INFINITY;
+    for a in dst_anchors {
+        if a.node == node {
+            let pen = a.bias.max(0.0);
+            if pen < best {
+                best = pen;
+            }
+        }
+    }
+    if best.is_finite() { best } else { 0.0 }
 }
 
 fn recent_path_via_too_close(

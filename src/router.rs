@@ -7,19 +7,19 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::astar::{PassParams, SearchScratch, astar_connect, unpack_node};
+use crate::astar::{Anchor, PassParams, SearchBounds, SearchScratch, astar_connect, unpack_node};
 use crate::board::{Board, NetRoute, Pad, RoutedSegment, RoutedVia};
 use crate::connectivity::{
-    RouteScore, count_all_unconnected, count_unconnected_pairs, score_routes,
+    RouteScore, count_all_unconnected, count_unconnected_pairs, score_routes_scoped,
 };
-use crate::drc::{DrcReport, check_drc};
-use crate::fanout::{FanoutPlan, analyze_fanout};
-use crate::geometry::Point;
+use crate::drc::{DrcReport, check_drc, check_drc_scoped};
+use crate::fanout::{FanoutPlan, analyze_fanout, dogbone_candidates};
+use crate::geometry::{BBox, Point};
 use crate::grid::{NetFootprint, RoutingGrid};
 use crate::length::{
     LengthConstraints, evaluate_lengths, net_total_length_um, tune_match_groups_with_context,
 };
-use crate::optimize::route_wirelength;
+use crate::optimize::{RouteSpatialIndex, route_wirelength};
 use crate::signal;
 
 /// Configuration for the autorouter.
@@ -29,6 +29,10 @@ pub struct RouterConfig {
     pub ignored_nets: HashSet<String>,
     /// Override DSN `(via_at_smd on|off)` when `Some`.
     pub via_at_smd: Option<bool>,
+    /// Optional drill hole-to-hole clearance override in micrometers.
+    pub hole_to_hole_um: Option<f64>,
+    /// Optional copper-to-board-edge clearance override in micrometers.
+    pub edge_clearance_um: Option<f64>,
     pub threads: usize,
     pub timeout_secs: Option<u64>,
     pub optimize: bool,
@@ -39,6 +43,10 @@ pub struct RouterConfig {
     pub initial_routes: Option<Vec<NetRoute>>,
     /// Optional max-length and match-group constraints.
     pub length_constraints: LengthConstraints,
+    /// Optional target net or class names to reroute (non-target initial routes stay frozen).
+    pub reroute_nets: Option<HashSet<String>>,
+    /// Optional local A* search padding in micrometers around target nets (default 4000um with initial routes).
+    pub reroute_pad_um: Option<f64>,
     /// Optional cancellation flag checked between passes and net routes.
     pub stop_flag: Option<Arc<AtomicBool>>,
 }
@@ -49,12 +57,16 @@ impl Default for RouterConfig {
             max_passes: 20,
             ignored_nets: HashSet::new(),
             via_at_smd: None,
+            hole_to_hole_um: None,
+            edge_clearance_um: None,
             threads: 1,
             timeout_secs: None,
             optimize: true,
             multi_start: 4,
             initial_routes: None,
             length_constraints: LengthConstraints::default(),
+            reroute_nets: None,
+            reroute_pad_um: None,
             stop_flag: None,
         }
     }
@@ -93,8 +105,7 @@ pub(crate) struct Terminal {
     pub(crate) exact: Point,
     pub(crate) pad_id: Option<usize>,
     pub(crate) layers: Vec<usize>,
-    /// `(sig_layer, gx, gy, optional_via_pos, pad_layer_for_stub)`.
-    pub(crate) entries: Vec<(usize, usize, usize, Option<Point>, usize)>,
+    pub(crate) anchors: Vec<Anchor>,
 }
 
 struct StartOutcome {
@@ -102,6 +113,38 @@ struct StartOutcome {
     score: RouteScore,
     passes_run: usize,
     stopped_early: bool,
+}
+
+/// Validates `--reroute-nets` targets against `board` net names, classes, and `--ignore`.
+pub fn validate_reroute_nets(board: &Board, targets: &HashSet<String>) -> Result<(), String> {
+    if targets.is_empty() {
+        return Err("--reroute-nets requires at least one net or class name".to_string());
+    }
+    let mut unmatched: Vec<&str> = targets
+        .iter()
+        .map(String::as_str)
+        .filter(|t| {
+            !board
+                .nets
+                .iter()
+                .any(|n| n.name == *t || n.class_name == *t)
+        })
+        .collect();
+    if !unmatched.is_empty() {
+        unmatched.sort_unstable();
+        return Err(format!(
+            "unknown --reroute-nets target(s): {}",
+            unmatched.join(", ")
+        ));
+    }
+    let any_active = board
+        .nets
+        .iter()
+        .any(|n| !n.ignored && (targets.contains(&n.name) || targets.contains(&n.class_name)));
+    if !any_active {
+        return Err("all nets matched by --reroute-nets are ignored".to_string());
+    }
+    Ok(())
 }
 
 /// Routes all non-ignored nets on `board` using multi-layer PathFinder negotiated congestion.
@@ -123,7 +166,7 @@ where
     let deadline = config.timeout_secs.map(|s| start + Duration::from_secs(s));
 
     let fanout = analyze_fanout(board);
-    let base_grid = RoutingGrid::build(board, &fanout, config.threads);
+    let mut base_grid = RoutingGrid::build(board, &fanout, config.threads);
 
     let routable_nets: Vec<usize> = board
         .nets
@@ -132,20 +175,22 @@ where
         .map(|n| n.id)
         .collect();
 
-    let net_components: Vec<Vec<Vec<Terminal>>> = board
-        .nets
-        .iter()
-        .map(|n| {
-            if n.ignored || n.pad_ids.len() < 2 {
-                Vec::new()
-            } else {
-                build_net_components(board, &base_grid, &fanout, n.id)
-            }
-        })
-        .collect();
-
+    let target_mask: Option<Vec<bool>> = config.reroute_nets.as_ref().map(|targets| {
+        board
+            .nets
+            .iter()
+            .map(|n| !n.ignored && (targets.contains(&n.name) || targets.contains(&n.class_name)))
+            .collect()
+    });
     let max_len_nets = config.length_constraints.max_length_net_ids(board);
-    let mut canonical_order = routable_nets.clone();
+    let mut canonical_order: Vec<usize> = match target_mask.as_ref() {
+        Some(mask) => routable_nets
+            .iter()
+            .copied()
+            .filter(|&nid| mask[nid])
+            .collect(),
+        None => routable_nets.clone(),
+    };
     canonical_order.sort_by(|&a, &b| {
         max_len_nets
             .contains(&b)
@@ -156,6 +201,47 @@ where
                     .unwrap_or(Ordering::Equal)
             })
     });
+
+    let frozen_index: Option<RouteSpatialIndex> = if let (Some(mask), Some(init)) =
+        (target_mask.as_ref(), config.initial_routes.as_deref())
+    {
+        base_grid.rasterize_frozen_routes(board, init, mask);
+        let idx = RouteSpatialIndex::build_filtered(board, init, |nid| {
+            nid < board.nets.len() && !mask[nid] && !board.nets[nid].ignored
+        });
+        (!idx.is_empty()).then_some(idx)
+    } else {
+        None
+    };
+
+    let search_bounds = target_mask.as_deref().and_then(|mask| {
+        let pad_um = if config.initial_routes.is_some() {
+            Some(config.reroute_pad_um.unwrap_or(4000.0))
+        } else {
+            config.reroute_pad_um
+        };
+        pad_um.and_then(|pad| {
+            compute_search_bounds(
+                board,
+                &base_grid,
+                mask,
+                config.initial_routes.as_deref(),
+                pad,
+            )
+        })
+    });
+
+    let net_components: Vec<Vec<Vec<Terminal>>> = board
+        .nets
+        .iter()
+        .map(|n| {
+            if n.ignored || n.pad_ids.len() < 2 {
+                Vec::new()
+            } else {
+                build_net_components(board, &base_grid, &fanout, n.id, frozen_index.as_ref())
+            }
+        })
+        .collect();
 
     let global_best = Mutex::new(RouteScore::WORST);
     let notify_best = |routes: &[NetRoute], score: RouteScore| {
@@ -175,9 +261,10 @@ where
         board,
         &base_grid,
         &net_components,
-        &routable_nets,
         &canonical_order,
         &max_len_nets,
+        target_mask.as_deref(),
+        search_bounds,
         config,
         deadline,
         &notify_best,
@@ -190,8 +277,9 @@ where
 
     if total_starts > 1
         && !best_outcome.score.is_perfect()
+        && !canonical_order.is_empty()
         && !is_cancelled(deadline, config.stop_flag.as_ref(), None)
-        && (config.max_passes > 0 || config.initial_routes.is_none())
+        && (config.max_passes > 0 || config.initial_routes.is_none() || target_mask.is_some())
     {
         let remaining = total_starts - 1;
         let worker_count = config.threads.max(1).min(remaining);
@@ -204,9 +292,9 @@ where
             for _ in 0..worker_count {
                 let base_ref = &base_grid;
                 let comps_ref = &net_components;
-                let routable_ref = &routable_nets;
                 let canon_ref = &canonical_order;
                 let max_len_ref = &max_len_nets;
+                let mask_ref = target_mask.as_deref();
                 let notify_ref = &notify_best;
                 let next_ref = &next_seed;
                 let perfect_ref = &found_perfect;
@@ -227,9 +315,10 @@ where
                             board,
                             base_ref,
                             comps_ref,
-                            routable_ref,
                             &order,
                             max_len_ref,
+                            mask_ref,
+                            search_bounds,
                             config,
                             deadline,
                             notify_ref,
@@ -307,9 +396,10 @@ fn run_single_start<F>(
     board: &Board,
     base_grid: &RoutingGrid,
     net_components: &[Vec<Vec<Terminal>>],
-    routable_nets: &[usize],
     net_order: &[usize],
     max_len_nets: &HashSet<usize>,
+    target_mask: Option<&[bool]>,
+    search_bounds: Option<SearchBounds>,
     config: &RouterConfig,
     deadline: Option<Instant>,
     notify_best: &F,
@@ -346,7 +436,7 @@ where
         }
     };
 
-    let has_initial = config.initial_routes.is_some();
+    let resume_active = config.initial_routes.is_some() && target_mask.is_none();
     let mut best_routes: Vec<NetRoute> = routes.clone();
     let mut best_score = RouteScore::WORST;
     let mut last_drc: Option<DrcReport> = None;
@@ -357,27 +447,39 @@ where
                 routes[nr.net_id] = nr.clone();
             }
         }
-        for &nid in routable_nets {
+        for &nid in net_order {
             routes[nid].unconnected_pairs =
                 count_unconnected_pairs(board, &net_components[nid], &routes[nid]);
-            if !routes[nid].segments.is_empty() || !routes[nid].vias.is_empty() {
-                footprints[nid] = grid.add_footprint(board, &routes[nid]);
-            }
         }
-        let (init_score, init_drc) = score_routes(board, &routes, &max_len_only);
+        let (init_score, init_drc) =
+            score_routes_scoped(board, &routes, target_mask, &max_len_only);
         best_score = init_score;
         best_routes = routes.clone();
-        last_drc = Some(init_drc);
         notify_best(&best_routes, full_score_for(&best_routes, best_score));
-    } else {
-        for &nid in routable_nets {
-            routes[nid].unconnected_pairs = net_components[nid].len().saturating_sub(1);
+        if resume_active {
+            for &nid in net_order {
+                if !routes[nid].segments.is_empty() || !routes[nid].vias.is_empty() {
+                    footprints[nid] = grid.add_footprint(board, &routes[nid]);
+                }
+            }
+            last_drc = Some(init_drc);
+        }
+    }
+    if !resume_active {
+        for &nid in net_order {
+            routes[nid] = NetRoute {
+                net_id: nid,
+                unconnected_pairs: net_components[nid].len().saturating_sub(1),
+                ..Default::default()
+            };
         }
     }
 
     let n3d = grid.sig_layers.len() * grid.n2d();
     let mut scratch = SearchScratch::new(n3d);
-    let effective_passes = if has_initial {
+    let effective_passes = if net_order.is_empty() {
+        0
+    } else if resume_active {
         config.max_passes
     } else {
         config.max_passes.max(1)
@@ -404,8 +506,9 @@ where
             strict_mode: false,
             max_expansions: 1_200_000,
         };
+        let pass_bounds = if pass < 2 { search_bounds } else { None };
 
-        let violating_max_len = if (pass > 0 || has_initial) && !max_len_nets.is_empty() {
+        let violating_max_len = if (pass > 0 || resume_active) && !max_len_nets.is_empty() {
             config
                 .length_constraints
                 .violating_max_length_net_ids(board, &routes)
@@ -413,7 +516,7 @@ where
             HashSet::new()
         };
         let mut violating_len_before: Option<f64> = None;
-        let to_route: Vec<usize> = if pass == 0 && !has_initial {
+        let to_route: Vec<usize> = if pass == 0 && !resume_active {
             net_order.to_vec()
         } else {
             let mut dirty: Vec<usize> = net_order
@@ -428,8 +531,12 @@ where
                 })
                 .collect();
             if dirty.is_empty() || pass == 0 || pass % 3 == 0 {
-                let drc = last_drc.take().unwrap_or_else(|| check_drc(board, &routes));
-                if drc.violations.is_empty() && dirty.is_empty() && violating_max_len.is_empty() {
+                let drc = last_drc
+                    .take()
+                    .unwrap_or_else(|| check_drc_scoped(board, &routes, target_mask));
+                let any_target_max_len_viol =
+                    net_order.iter().any(|nid| violating_max_len.contains(nid));
+                if drc.violations.is_empty() && dirty.is_empty() && !any_target_max_len_viol {
                     last_drc = Some(drc);
                     break;
                 }
@@ -512,22 +619,30 @@ where
                 &net_components[nid],
                 nid,
                 &net_params,
+                pass_bounds,
                 &mut scratch,
             );
             footprints[nid] = grid.add_footprint(board, &nr);
             routes[nid] = nr;
         }
+        if stopped_early {
+            break;
+        }
 
         let congested = grid.bump_history(&footprints, 1.0 + pass as f32 * 0.4);
-        let unconn: usize = routes.iter().map(|r| r.unconnected_pairs).sum();
+        let unconn: usize = net_order
+            .iter()
+            .map(|&nid| routes[nid].unconnected_pairs)
+            .sum();
 
-        // Run full continuous DRC when clean, every 3rd pass, on unconnected improvements, or on final pass.
+        // Run continuous DRC when clean, every 3rd pass, on unconnected improvements, or on final pass.
         let need_drc = congested == 0
             || pass % 3 == 2
             || pass + 1 == effective_passes
             || unconn < best_score.unconnected_pairs;
         if need_drc {
-            let (pass_score, pass_drc) = score_routes(board, &routes, &max_len_only);
+            let (pass_score, pass_drc) =
+                score_routes_scoped(board, &routes, target_mask, &max_len_only);
             if pass_score.is_better_than(best_score) {
                 best_score = pass_score;
                 best_routes = routes.clone();
@@ -563,7 +678,7 @@ where
                     best_score.unconnected_pairs + (best_score.unconnected_pairs / 3).max(4);
                 if pass_score.unconnected_pairs > bad_limit {
                     routes = best_routes.clone();
-                    rebuild_occupancy(board, &mut grid, &routes, &mut footprints);
+                    rebuild_occupancy(board, &mut grid, &routes, &mut footprints, net_order);
                     last_drc = None;
                     continue;
                 }
@@ -573,7 +688,7 @@ where
     }
 
     // Rescue + DRC convergence loop: punch through remaining unconnected nets, then displace peers.
-    if effective_passes > 0 && !best_score.is_perfect() {
+    if effective_passes > 0 && !best_score.is_perfect() && !stopped_early {
         for rescue_round in 0..10 {
             if is_cancelled(deadline, config.stop_flag.as_ref(), peer_perfect) {
                 stopped_early = true;
@@ -584,7 +699,9 @@ where
                 .copied()
                 .filter(|&nid| routes[nid].unconnected_pairs > 0)
                 .collect();
-            let drc_cur = last_drc.take().unwrap_or_else(|| check_drc(board, &routes));
+            let drc_cur = last_drc
+                .take()
+                .unwrap_or_else(|| check_drc_scoped(board, &routes, target_mask));
             let any_cong = net_order
                 .iter()
                 .any(|&nid| grid.has_conflict(&footprints[nid]));
@@ -613,13 +730,17 @@ where
                         &net_components[nid],
                         nid,
                         &rescue_params,
+                        None,
                         &mut scratch,
                     );
                     footprints[nid] = grid.add_footprint(board, &nr);
                     routes[nid] = nr;
                     protected.insert(nid);
                 }
-                check_drc(board, &routes)
+                if stopped_early {
+                    break;
+                }
+                check_drc_scoped(board, &routes, target_mask)
             } else {
                 drc_cur
             };
@@ -671,6 +792,7 @@ where
                     &net_components[nid],
                     nid,
                     &peer_params,
+                    None,
                     &mut scratch,
                 );
                 let final_nr = if peer_params.strict_mode && nr.unconnected_pairs > old_unconn {
@@ -680,15 +802,27 @@ where
                         h_weight: 1.85,
                         max_expansions: 700_000,
                     };
-                    route_single_net(board, &grid, &net_components[nid], nid, &soft, &mut scratch)
+                    route_single_net(
+                        board,
+                        &grid,
+                        &net_components[nid],
+                        nid,
+                        &soft,
+                        None,
+                        &mut scratch,
+                    )
                 } else {
                     nr
                 };
                 footprints[nid] = grid.add_footprint(board, &final_nr);
                 routes[nid] = final_nr;
             }
+            if stopped_early {
+                break;
+            }
 
-            let (round_score, round_drc) = score_routes(board, &routes, &max_len_only);
+            let (round_score, round_drc) =
+                score_routes_scoped(board, &routes, target_mask, &max_len_only);
             if round_score.is_better_than(best_score) {
                 best_score = round_score;
                 best_routes = routes.clone();
@@ -706,26 +840,49 @@ where
         routes = best_routes;
     }
 
-    count_all_unconnected(board, net_components, &mut routes, routable_nets);
-    let (pre_score, _) = score_routes(board, &routes, &config.length_constraints);
+    count_all_unconnected(board, net_components, &mut routes, net_order);
+    let (pre_score, _) =
+        score_routes_scoped(board, &routes, target_mask, &config.length_constraints);
     let has_match_groups = !config.length_constraints.match_groups.is_empty();
-    if config.optimize || has_match_groups {
+    let mut need_finalize = !config.optimize && !stopped_early && !net_order.is_empty();
+    best_score = pre_score;
+
+    if (config.optimize || has_match_groups) && !stopped_early && !net_order.is_empty() {
         let pre_opt = routes.clone();
         if config.optimize {
-            crate::optimize::optimize_routes(board, &mut routes);
+            crate::optimize::optimize_routes_subset(board, &mut routes, target_mask);
             if has_match_groups {
-                count_all_unconnected(board, net_components, &mut routes, routable_nets);
-                let (opt_score, _) = score_routes(board, &routes, &max_len_only);
+                count_all_unconnected(board, net_components, &mut routes, net_order);
+                let (opt_score, _) =
+                    score_routes_scoped(board, &routes, target_mask, &max_len_only);
                 if opt_score.unconnected_pairs > pre_score.unconnected_pairs
                     || opt_score.drc_violations > pre_score.drc_violations
                 {
                     routes = pre_opt.clone();
+                    need_finalize = true;
                 }
             }
         }
+        if need_finalize {
+            let pre_fin = routes.clone();
+            crate::optimize::finalize_routes_subset(board, &mut routes, target_mask);
+            count_all_unconnected(board, net_components, &mut routes, net_order);
+            let eval_c = if has_match_groups {
+                &max_len_only
+            } else {
+                &config.length_constraints
+            };
+            let (fin_score, _) = score_routes_scoped(board, &routes, target_mask, eval_c);
+            if fin_score.unconnected_pairs > pre_score.unconnected_pairs
+                || fin_score.drc_violations > pre_score.drc_violations
+            {
+                routes = pre_fin;
+            }
+            need_finalize = false;
+        }
         // Run meander tuning after pull-tight so optimization never collapses inserted meanders.
         if has_match_groups {
-            if stopped_early || is_cancelled(deadline, config.stop_flag.as_ref(), peer_perfect) {
+            if is_cancelled(deadline, config.stop_flag.as_ref(), peer_perfect) {
                 stopped_early = true;
             } else {
                 let cancel_check =
@@ -735,6 +892,7 @@ where
                     &mut routes,
                     &config.length_constraints,
                     Some(net_components),
+                    target_mask,
                     &cancel_check,
                 );
                 if cancel_check() {
@@ -742,8 +900,9 @@ where
                 }
             }
         }
-        count_all_unconnected(board, net_components, &mut routes, routable_nets);
-        let (post_score, _) = score_routes(board, &routes, &config.length_constraints);
+        count_all_unconnected(board, net_components, &mut routes, net_order);
+        let (post_score, _) =
+            score_routes_scoped(board, &routes, target_mask, &config.length_constraints);
         if post_score.unconnected_pairs <= pre_score.unconnected_pairs
             && post_score.drc_violations <= pre_score.drc_violations
             && post_score.length_violations <= pre_score.length_violations
@@ -753,10 +912,28 @@ where
             notify_best(&routes, best_score);
         } else {
             routes = pre_opt;
-            best_score = pre_score;
+            need_finalize = true;
         }
-    } else {
-        best_score = pre_score;
+    }
+
+    if need_finalize {
+        let pre_fin = routes.clone();
+        crate::optimize::finalize_routes_subset(board, &mut routes, target_mask);
+        count_all_unconnected(board, net_components, &mut routes, net_order);
+        let (final_score, _) =
+            score_routes_scoped(board, &routes, target_mask, &config.length_constraints);
+        if final_score.unconnected_pairs <= best_score.unconnected_pairs
+            && final_score.drc_violations <= best_score.drc_violations
+            && final_score.length_violations <= best_score.length_violations
+            && final_score.length_excess_um <= best_score.length_excess_um + 0.1
+        {
+            if final_score.is_better_than(best_score) {
+                notify_best(&routes, final_score);
+            }
+            best_score = final_score;
+        } else {
+            routes = pre_fin;
+        }
     }
 
     StartOutcome {
@@ -773,6 +950,7 @@ fn route_single_net(
     components: &[Vec<Terminal>],
     net_id: usize,
     params: &PassParams,
+    search_bounds: Option<SearchBounds>,
     scratch: &mut SearchScratch,
 ) -> NetRoute {
     let mut nr = NetRoute {
@@ -799,8 +977,8 @@ fn route_single_net(
             continue;
         }
 
-        let src_entries = collect_comp_anchors(components, &uf, ra, n2d, grid.cols);
-        let dst_entries = collect_comp_anchors(components, &uf, rb, n2d, grid.cols);
+        let src_entries = collect_comp_anchors(components, &uf, ra);
+        let dst_entries = collect_comp_anchors(components, &uf, rb);
         let src_extra = &comp_nodes[ra];
         let dst_extra = &comp_nodes[rb];
 
@@ -811,7 +989,7 @@ fn route_single_net(
             continue;
         }
 
-        let min_via_dist = (2.0 * rules.via_radius + rules.via_via).max(rules.via_drill + 205.0);
+        let min_via_dist = board.min_via_spacing(net_id);
         let path_opt = astar_connect(
             grid,
             net_id,
@@ -822,6 +1000,7 @@ fn route_single_net(
             &via_positions,
             min_via_dist,
             params,
+            search_bounds,
             scratch,
         )
         .or_else(|| {
@@ -845,6 +1024,7 @@ fn route_single_net(
                 &via_positions,
                 min_via_dist,
                 &retry,
+                None,
                 scratch,
             )
         });
@@ -1075,7 +1255,7 @@ pub(crate) fn build_physical_components(board: &Board, net_id: usize) -> Vec<Vec
             exact: *pt,
             pad_id: *pad_opt,
             layers: layers.clone(),
-            entries: Vec::new(),
+            anchors: Vec::new(),
         });
     }
 
@@ -1087,13 +1267,16 @@ pub(crate) fn build_net_components(
     grid: &RoutingGrid,
     fanout: &FanoutPlan,
     net_id: usize,
+    frozen: Option<&RouteSpatialIndex>,
 ) -> Vec<Vec<Terminal>> {
     let mut comps = build_physical_components(board, net_id);
     let mut sbuf = Vec::new();
+    let mut fbuf = Vec::new();
     for comp in &mut comps {
         for t in comp {
-            t.entries = compute_terminal_entries(
-                board, grid, fanout, net_id, t.exact, &t.layers, t.pad_id, &mut sbuf,
+            t.anchors = compute_terminal_entries(
+                board, grid, fanout, net_id, t.exact, &t.layers, t.pad_id, frozen, &mut sbuf,
+                &mut fbuf,
             );
         }
     }
@@ -1109,12 +1292,30 @@ fn compute_terminal_entries(
     exact: Point,
     layers: &[usize],
     pad_opt: Option<usize>,
+    frozen: Option<&RouteSpatialIndex>,
     sbuf: &mut Vec<usize>,
-) -> Vec<(usize, usize, usize, Option<Point>, usize)> {
-    let mut entries = Vec::new();
+    fbuf: &mut Vec<usize>,
+) -> Vec<Anchor> {
+    let mut anchors = Vec::new();
+    let n2d = grid.n2d();
+    let cols = grid.cols;
     let (gx, gy) = grid.snap(exact);
-    let c2 = gy * grid.cols + gx;
-    let width = board.nets[net_id].rules.width;
+    let c2 = gy * cols + gx;
+    let gp = grid.pt_of(gx, gy);
+    let rules = &board.nets[net_id].rules;
+    let width = rules.width;
+
+    let frozen_seg_ok = |bl: usize, a: Point, b: Point, buf: &mut Vec<usize>| -> bool {
+        frozen.is_none_or(|f| {
+            let cand = RoutedSegment {
+                layer: bl,
+                a,
+                b,
+                width,
+            };
+            f.clears_segment(board, net_id, &cand, 0.5, buf)
+        })
+    };
 
     let mut primary_pad_layer = None;
     for &bl in layers {
@@ -1122,7 +1323,18 @@ fn compute_terminal_entries(
             if primary_pad_layer.is_none() {
                 primary_pad_layer = Some(bl);
             }
-            entries.push((sl, gx, gy, None, bl));
+            let layer_start = anchors.len();
+            if grid.wire_allowed(sl, c2, net_id)
+                && (exact.dist(gp) <= 1.0 || frozen_seg_ok(bl, exact, gp, fbuf))
+            {
+                anchors.push(Anchor {
+                    node: (sl * n2d + c2) as u32,
+                    exact,
+                    via_pos: None,
+                    pad_layer: bl,
+                    bias: 0.0,
+                });
+            }
             for dy in -2_isize..=2 {
                 for dx in -2_isize..=2 {
                     if dx == 0 && dy == 0 {
@@ -1130,51 +1342,195 @@ fn compute_terminal_entries(
                     }
                     let nx = gx as isize + dx;
                     let ny = gy as isize + dy;
-                    if nx < 0 || ny < 0 || nx >= grid.cols as isize || ny >= grid.rows as isize {
+                    if nx < 0 || ny < 0 || nx >= cols as isize || ny >= grid.rows as isize {
                         continue;
                     }
                     let (nxu, nyu) = (nx as usize, ny as usize);
-                    let nc2 = nyu * grid.cols + nxu;
+                    let nc2 = nyu * cols + nxu;
+                    let np = grid.pt_of(nxu, nyu);
                     if grid.wire_allowed(sl, nc2, net_id)
-                        && board.check_segment_static_with_buf(
-                            net_id,
-                            bl,
-                            exact,
-                            grid.pt_of(nxu, nyu),
-                            width,
-                            0.0,
-                            sbuf,
-                        )
+                        && board
+                            .check_segment_static_with_buf(net_id, bl, exact, np, width, 0.0, sbuf)
+                        && frozen_seg_ok(bl, exact, np, fbuf)
                     {
-                        entries.push((sl, nxu, nyu, None, bl));
+                        anchors.push(Anchor {
+                            node: (sl * n2d + nc2) as u32,
+                            exact,
+                            via_pos: None,
+                            pad_layer: bl,
+                            bias: 0.0,
+                        });
                     }
                 }
+            }
+            // Probe along inward boundary normal so edge-adjacent pads can escape into the legal interior.
+            if let Some(pid) = pad_opt
+                && board.boundary.len() >= 3
+                && !grid.wire_allowed(sl, c2, net_id)
+                && crate::geometry::point_in_polygon(exact, &board.boundary)
+                && let Some(edge_pt) =
+                    crate::geometry::closest_point_on_polygon_edge(exact, &board.boundary)
+            {
+                let dx = exact.x - edge_pt.x;
+                let dy = exact.y - edge_pt.y;
+                let d_edge = dx.hypot(dy);
+                if d_edge > 1e-6 {
+                    let (nx, ny) = (dx / d_edge, dy / d_edge);
+                    let c45 = std::f64::consts::FRAC_1_SQRT_2;
+                    let dirs = [
+                        (nx, ny),
+                        ((nx - ny) * c45, (nx + ny) * c45),
+                        ((nx + ny) * c45, (-nx + ny) * c45),
+                    ];
+                    let edge_margin = board
+                        .edge_clearance_um
+                        .unwrap_or_else(|| board.nets[net_id].rules.clearance.max(265.0))
+                        + grid.max_half_w.max(width * 0.5);
+                    let max_probe = ((edge_margin - d_edge).max(0.0) * 1.5)
+                        + board.pads[pid].max_radius
+                        + grid.step * 4.0;
+                    let max_steps = (max_probe / grid.step).ceil().max(1.0) as usize;
+                    for (ux, uy) in dirs {
+                        let mut found = 0usize;
+                        for step_i in 1..=max_steps {
+                            let dist = step_i as f64 * grid.step;
+                            let probe = Point::new(exact.x + ux * dist, exact.y + uy * dist);
+                            let (px, py) = grid.snap(probe);
+                            let pc2 = py * cols + px;
+                            let pp = grid.pt_of(px, py);
+                            if grid.wire_allowed(sl, pc2, net_id)
+                                && board.check_segment_static_with_buf(
+                                    net_id, bl, exact, pp, width, 0.0, sbuf,
+                                )
+                                && frozen_seg_ok(bl, exact, pp, fbuf)
+                            {
+                                let node = (sl * n2d + pc2) as u32;
+                                if !anchors[layer_start..].iter().any(|a| a.node == node) {
+                                    anchors.push(Anchor {
+                                        node,
+                                        exact,
+                                        via_pos: None,
+                                        pad_layer: bl,
+                                        bias: 0.0,
+                                    });
+                                }
+                                found += 1;
+                                if found >= 2 {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if anchors.len() == layer_start
+                && (exact.dist(gp) <= 1.0 || frozen_seg_ok(bl, exact, gp, fbuf))
+            {
+                anchors.push(Anchor {
+                    node: (sl * n2d + c2) as u32,
+                    exact,
+                    via_pos: None,
+                    pad_layer: bl,
+                    bias: 0.0,
+                });
             }
         }
     }
 
     if let Some(pid) = pad_opt {
         let pf = &fanout.pads[pid];
-        if pf.pofv_allowed {
-            let pad_bl = primary_pad_layer.unwrap_or(0);
-            for (sl, &bl) in grid.sig_layers.iter().enumerate() {
-                if bl != pad_bl && grid.wire_allowed(sl, c2, net_id) {
-                    entries.push((sl, gx, gy, Some(exact), pad_bl));
+        let pad_bl = primary_pad_layer.unwrap_or(0);
+        if rules.via_layers.contains(&pad_bl) {
+            let emit_via_anchors = |anchors: &mut Vec<Anchor>,
+                                    vc2: usize,
+                                    vpos: Point,
+                                    vgp: Point,
+                                    fbuf: &mut Vec<usize>|
+             -> bool {
+                let mut emitted = false;
+                for (sl, &bl) in grid.sig_layers.iter().enumerate() {
+                    if bl != pad_bl
+                        && rules.via_layers.contains(&bl)
+                        && grid.wire_allowed(sl, vc2, net_id)
+                        && (vpos.dist(vgp) <= 1.0 || frozen_seg_ok(bl, vpos, vgp, fbuf))
+                    {
+                        // Gently prioritize ring-0 surface escape and ring-balanced inner layers.
+                        let bias = match (pf.bga_ring, pf.preferred_escape_layer) {
+                            (Some(0), Some(pref)) if pref == pad_bl => 3.5,
+                            (_, Some(pref)) if pref == bl => -1.0,
+                            (_, Some(_)) => 2.0,
+                            _ => 0.0,
+                        };
+                        anchors.push(Anchor {
+                            node: (sl * n2d + vc2) as u32,
+                            exact,
+                            via_pos: Some(vpos),
+                            pad_layer: pad_bl,
+                            bias,
+                        });
+                        emitted = true;
+                    }
                 }
+                emitted
+            };
+
+            let mut pofv_emitted = false;
+            if pf.pofv_allowed
+                && frozen.is_none_or(|f| f.clears_via(board, net_id, exact, 0.5, fbuf))
+            {
+                pofv_emitted = emit_via_anchors(&mut anchors, c2, exact, gp, fbuf);
             }
-        } else if let Some(db_pos) = pf.dogbone_via {
-            let (dgx, dgy) = grid.snap(db_pos);
-            let dc2 = dgy * grid.cols + dgx;
-            let pad_bl = primary_pad_layer.unwrap_or(0);
-            for (sl, &bl) in grid.sig_layers.iter().enumerate() {
-                if bl != pad_bl && grid.wire_allowed(sl, dc2, net_id) {
-                    entries.push((sl, dgx, dgy, Some(db_pos), pad_bl));
+
+            if !pofv_emitted {
+                let db_ok = |cand: Point, fbuf: &mut Vec<usize>| -> Option<(usize, usize)> {
+                    let (dgx, dgy) = grid.snap(cand);
+                    if let Some(f) = frozen
+                        && (!f.clears_via(board, net_id, cand, 0.5, fbuf)
+                            || !frozen_seg_ok(pad_bl, exact, cand, fbuf))
+                    {
+                        return None;
+                    }
+                    Some((dgx, dgy))
+                };
+                let chosen_db = pf
+                    .dogbone_via
+                    .and_then(|pos| db_ok(pos, fbuf).map(|g| (pos, g)))
+                    .or_else(|| {
+                        if frozen.is_none() || !pf.is_dense_bga {
+                            return None;
+                        }
+                        let pad = &board.pads[pid];
+                        let (centroid, pitch, basis_theta) = fanout
+                            .bga_clusters
+                            .iter()
+                            .find(|c| c.pad_layer == pad_bl && c.pad_ids.contains(&pid))
+                            .map_or((pad.center, pf.nearest_neighbor_pitch, 0.0), |c| {
+                                (c.centroid, c.pitch_um, c.basis_theta)
+                            });
+                        dogbone_candidates(pad, centroid, pitch, basis_theta)
+                            .into_iter()
+                            .find_map(|cand| {
+                                if board.check_via_static_with_buf(net_id, cand, 0.0, sbuf)
+                                    && board.check_segment_static_with_buf(
+                                        net_id, pad_bl, exact, cand, width, 0.0, sbuf,
+                                    )
+                                {
+                                    db_ok(cand, fbuf).map(|g| (cand, g))
+                                } else {
+                                    None
+                                }
+                            })
+                    });
+                if let Some((db_pos, (dgx, dgy))) = chosen_db {
+                    let dc2 = dgy * cols + dgx;
+                    let dgp = grid.pt_of(dgx, dgy);
+                    emit_via_anchors(&mut anchors, dc2, db_pos, dgp, fbuf);
                 }
             }
         }
     }
 
-    entries
+    anchors
 }
 
 pub(crate) fn build_mst(components: &[Vec<Terminal>]) -> Vec<(usize, usize)> {
@@ -1222,29 +1578,83 @@ pub(crate) fn build_mst(components: &[Vec<Terminal>]) -> Vec<(usize, usize)> {
     edges
 }
 
-fn collect_comp_anchors(
-    components: &[Vec<Terminal>],
-    uf: &[usize],
-    root: usize,
-    n2d: usize,
-    cols: usize,
-) -> Vec<(u32, Point, Option<Point>, usize)> {
+fn collect_comp_anchors(components: &[Vec<Terminal>], uf: &[usize], root: usize) -> Vec<Anchor> {
     let mut out = Vec::new();
     for (ci, comp) in components.iter().enumerate() {
         let mut r = ci;
         while uf[r] != r {
             r = uf[r];
         }
-        if r != root {
-            continue;
-        }
-        for t in comp {
-            for &(sl, gx, gy, via_opt, pad_bl) in &t.entries {
-                out.push(((sl * n2d + gy * cols + gx) as u32, t.exact, via_opt, pad_bl));
+        if r == root {
+            for t in comp {
+                out.extend_from_slice(&t.anchors);
             }
         }
     }
     out
+}
+
+fn compute_search_bounds(
+    board: &Board,
+    grid: &RoutingGrid,
+    target_mask: &[bool],
+    initial_routes: Option<&[NetRoute]>,
+    pad_um: f64,
+) -> Option<SearchBounds> {
+    let mut bb: Option<BBox> = None;
+    let mut include = |b: BBox| {
+        bb = Some(match bb {
+            Some(cur) => cur.union(b),
+            None => b,
+        });
+    };
+
+    for net in &board.nets {
+        if !target_mask.get(net.id).copied().unwrap_or(false) {
+            continue;
+        }
+        for &pid in &net.pad_ids {
+            include(board.pads[pid].bbox);
+        }
+    }
+    for fs in &board.fixed_segments {
+        if fs
+            .net_id
+            .is_some_and(|id| target_mask.get(id).copied().unwrap_or(false))
+        {
+            include(fs.bbox);
+        }
+    }
+    for fv in &board.fixed_vias {
+        if fv
+            .net_id
+            .is_some_and(|id| target_mask.get(id).copied().unwrap_or(false))
+        {
+            include(fv.bbox);
+        }
+    }
+    if let Some(init) = initial_routes {
+        for nr in init {
+            if !target_mask.get(nr.net_id).copied().unwrap_or(false) {
+                continue;
+            }
+            for seg in &nr.segments {
+                include(BBox::from_points(&[seg.a, seg.b], seg.width * 0.5));
+            }
+            for via in &nr.vias {
+                include(BBox::from_point(via.pos, via.radius));
+            }
+        }
+    }
+
+    let expanded = bb?.expand(pad_um.max(0.0));
+    let (min_gx, min_gy, max_gx, max_gy) = grid.bbox_cells(expanded);
+    Some(SearchBounds {
+        min_gx,
+        max_gx,
+        min_gy,
+        max_gy,
+    })
 }
 
 fn rebuild_occupancy(
@@ -1252,12 +1662,15 @@ fn rebuild_occupancy(
     grid: &mut RoutingGrid,
     routes: &[NetRoute],
     footprints: &mut [NetFootprint],
+    net_order: &[usize],
 ) {
     grid.clear_occupancy();
-    for (nid, nr) in routes.iter().enumerate() {
-        if nr.segments.is_empty() && nr.vias.is_empty() {
-            footprints[nid] = NetFootprint::default();
-        } else {
+    for fp in footprints.iter_mut() {
+        *fp = NetFootprint::default();
+    }
+    for &nid in net_order {
+        let nr = &routes[nid];
+        if !nr.segments.is_empty() || !nr.vias.is_empty() {
             footprints[nid] = grid.add_footprint(board, nr);
         }
     }
@@ -1328,14 +1741,11 @@ fn pad_touches_point(pad: &Pad, pt: Point, layers: &[usize], radius: f64) -> boo
     })
 }
 
-fn match_anchor(
-    anchors: &[(u32, Point, Option<Point>, usize)],
-    node: u32,
-) -> Option<(Point, Option<Point>, usize)> {
+fn match_anchor(anchors: &[Anchor], node: u32) -> Option<(Point, Option<Point>, usize)> {
     anchors
         .iter()
-        .find(|&&(n, _, _, _)| n == node)
-        .map(|&(_, pt, via_opt, bl)| (pt, via_opt, bl))
+        .find(|a| a.node == node)
+        .map(|a| (a.exact, a.via_pos, a.pad_layer))
 }
 
 fn push_unique_via(
@@ -1427,6 +1837,79 @@ fn log_unconnected_debug(
             routes[nid].unconnected_pairs,
             net_components[nid].len(),
             pads_info,
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dsn::DsnDesign;
+
+    #[test]
+    fn terminal_entries_filter_via_layers() {
+        let dsn = r#"(pcb blind_entries.dsn
+  (parser (string_quote ") (host_cad "KiCad's Pcbnew") (host_version "10.0.1"))
+  (resolution um 10)
+  (unit um)
+  (structure
+    (layer F.Cu (type signal) (property (index 0)))
+    (layer In1.Cu (type power) (property (index 1)))
+    (layer In2.Cu (type signal) (property (index 2)))
+    (layer In3.Cu (type power) (property (index 3)))
+    (layer In4.Cu (type signal) (property (index 4)))
+    (layer B.Cu (type signal) (property (index 5)))
+    (boundary (rect pcb 0 0 10000 10000))
+    (via "Via[0-2]_150:75_um")
+    (rule (width 80) (clearance 80))
+    (control (via_at_smd on))
+  )
+  (placement
+    (component P1
+      (place U1 3000 5000 front 0)
+      (place U2 7000 5000 front 0)
+    )
+  )
+  (library
+    (image P1 (pin SMD_220 1 0 0))
+    (padstack SMD_220 (shape (circle F.Cu 220)) (attach off))
+    (padstack "Via[0-2]_150:75_um"
+      (shape (circle F.Cu 150))
+      (shape (circle In1.Cu 150))
+      (shape (circle In2.Cu 150))
+      (attach off)
+    )
+  )
+  (network
+    (net /SIG (pins U1-1 U2-1))
+    (class default /SIG
+      (circuit (use_via "Via[0-2]_150:75_um"))
+      (rule (width 80) (clearance 80))
+    )
+  )
+  (wiring)
+)"#;
+        let design = DsnDesign::parse(dsn).unwrap();
+        let board = Board::from_dsn(&design, &HashSet::new(), Some(true)).unwrap();
+        let fanout = analyze_fanout(&board);
+        let grid = RoutingGrid::build(&board, &fanout, 1);
+        let nid = board.net_name_to_id["/SIG"];
+        let comps = build_net_components(&board, &grid, &fanout, nid, None);
+        let n2d = grid.n2d();
+        let via_layers: Vec<usize> = comps
+            .iter()
+            .flatten()
+            .flat_map(|t| t.anchors.iter())
+            .filter(|a| a.via_pos.is_some())
+            .map(|a| {
+                let (sl, _, _) = unpack_node(a.node, n2d, grid.cols);
+                grid.sig_layers[sl]
+            })
+            .collect();
+        assert!(!via_layers.is_empty(), "expected blind POFV via anchors");
+        assert!(
+            via_layers.iter().all(|&bl| bl == 2),
+            "blind via [0-2] must only emit via anchors on In2.Cu (2), got {via_layers:?}"
         );
     }
 }

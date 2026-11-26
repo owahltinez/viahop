@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, HashSet};
 
 use crate::board::{Board, NetRoute};
-use crate::drc::check_drc;
+use crate::drc::check_drc_scoped;
 use crate::geometry::{point_to_segment_dist, segment_to_segment_dist};
 use crate::length::{LengthConstraints, evaluate_lengths};
 use crate::optimize::route_wirelength;
@@ -63,8 +63,22 @@ pub fn score_routes(
     routes: &[NetRoute],
     constraints: &LengthConstraints,
 ) -> (RouteScore, crate::drc::DrcReport) {
-    let drc = check_drc(board, routes);
-    let unconnected_pairs: usize = routes.iter().map(|r| r.unconnected_pairs).sum();
+    score_routes_scoped(board, routes, None, constraints)
+}
+
+/// Evaluates routing quality scoped to `target_mask` for unconnected pairs and DRC violations.
+pub(crate) fn score_routes_scoped(
+    board: &Board,
+    routes: &[NetRoute],
+    target_mask: Option<&[bool]>,
+    constraints: &LengthConstraints,
+) -> (RouteScore, crate::drc::DrcReport) {
+    let drc = check_drc_scoped(board, routes, target_mask);
+    let unconnected_pairs: usize = routes
+        .iter()
+        .filter(|r| target_mask.is_none_or(|m| m.get(r.net_id).copied().unwrap_or(false)))
+        .map(|r| r.unconnected_pairs)
+        .sum();
     let len_report = evaluate_lengths(board, routes, constraints);
     let length_violations = len_report.violations.len();
     let length_excess_um: f64 = len_report.violations.iter().map(|v| v.excess_um).sum();

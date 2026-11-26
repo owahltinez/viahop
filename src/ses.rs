@@ -7,6 +7,7 @@ use std::path::Path;
 use crate::board::{Board, NetRoute, RoutedSegment, RoutedVia};
 use crate::dsn::{DsnDesign, Side};
 use crate::geometry::{Point, Shape};
+use crate::optimize::{prune_dead_vias, split_segments_at_junctions};
 use crate::sexp::{self, SExp, format_atom};
 
 /// Serializes routed tracks and vias into a Specctra `.ses` file compatible with
@@ -74,10 +75,23 @@ pub fn write_ses(design: &DsnDesign, board: &Board, routes: &[NetRoute]) -> Stri
     );
     let _ = writeln!(out, "    )");
 
+    // Clean per-net geometry: prune dead single-layer vias and split segments at T-junctions/vias.
+    let cleaned: Vec<(usize, Vec<RoutedSegment>, Vec<RoutedVia>)> = routes
+        .iter()
+        .filter(|nr| !nr.segments.is_empty() || !nr.vias.is_empty())
+        .map(|nr| {
+            let mut active = nr.clone();
+            prune_dead_vias(board, &mut active);
+            let split_segs = split_segments_at_junctions(&active.segments, &active.vias);
+            (nr.net_id, split_segs, active.vias)
+        })
+        .filter(|(_, segs, vias)| !segs.is_empty() || !vias.is_empty())
+        .collect();
+
     // library_out: emit deduplicated via padstacks used by routed vias (plus default structure vias).
     let mut used_vias: HashSet<String> = HashSet::new();
-    for nr in routes {
-        for v in &nr.vias {
+    for (_, _, vias) in &cleaned {
+        for v in vias {
             used_vias.insert(v.padstack.clone());
         }
     }
@@ -95,13 +109,10 @@ pub fn write_ses(design: &DsnDesign, board: &Board, routes: &[NetRoute]) -> Stri
 
     // network_out: emit only nets that have newly routed segments or vias.
     let _ = writeln!(out, "    (network_out");
-    for nr in routes {
-        if nr.segments.is_empty() && nr.vias.is_empty() {
-            continue;
-        }
-        let net_name = &board.nets[nr.net_id].name;
+    for (net_id, segs, vias) in &cleaned {
+        let net_name = &board.nets[*net_id].name;
         let _ = writeln!(out, "      (net {}", format_atom(net_name));
-        let chains = chain_segments(&nr.segments);
+        let chains = chain_segments(segs, vias);
         for (layer, width, pts) in chains {
             let layer_name = &board.layer_names[layer];
             let _ = writeln!(out, "        (wire");
@@ -122,7 +133,7 @@ pub fn write_ses(design: &DsnDesign, board: &Board, routes: &[NetRoute]) -> Stri
             let _ = writeln!(out, "          )");
             let _ = writeln!(out, "        )");
         }
-        for v in &nr.vias {
+        for v in vias {
             let _ = writeln!(
                 out,
                 "        (via {} {} {}",
@@ -185,10 +196,17 @@ fn write_via_padstack(
     let _ = writeln!(out, "      )");
 }
 
-/// Joins contiguous segments on the same layer & width into compact polylines in O(N) time.
-fn chain_segments(segments: &[RoutedSegment]) -> Vec<(usize, f64, Vec<Point>)> {
+/// Joins unbranched segments on the same layer & width into polylines, stopping at tees and vias.
+fn chain_segments(segments: &[RoutedSegment], vias: &[RoutedVia]) -> Vec<(usize, f64, Vec<Point>)> {
     let pt_key =
         |p: Point| -> (i64, i64) { ((p.x * 100.0).round() as i64, (p.y * 100.0).round() as i64) };
+    let mut via_keys: HashSet<(usize, i64, i64)> = HashSet::new();
+    for v in vias {
+        let vk = pt_key(v.pos);
+        for &l in &v.layers {
+            via_keys.insert((l, vk.0, vk.1));
+        }
+    }
     let mut adj: HashMap<(usize, i64, i64), Vec<usize>> = HashMap::new();
     for (i, s) in segments.iter().enumerate() {
         let ka = pt_key(s.a);
@@ -202,7 +220,13 @@ fn chain_segments(segments: &[RoutedSegment]) -> Vec<(usize, f64, Vec<Point>)> {
     let find_next =
         |tip: Point, layer: usize, width: f64, used: &[bool]| -> Option<(usize, Point)> {
             let tk = pt_key(tip);
+            if via_keys.contains(&(layer, tk.0, tk.1)) {
+                return None;
+            }
             let cands = adj.get(&(layer, tk.0, tk.1))?;
+            if cands.len() != 2 {
+                return None;
+            }
             for &j in cands {
                 if used[j] || (segments[j].width - width).abs() > 0.1 {
                     continue;

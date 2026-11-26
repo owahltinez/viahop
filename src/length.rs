@@ -6,7 +6,7 @@ use std::f64::consts::SQRT_2;
 
 use crate::board::{Board, NetRoute, RoutedSegment};
 use crate::connectivity::count_unconnected_pairs;
-use crate::drc::check_drc;
+use crate::drc::check_drc_scoped;
 use crate::geometry::{BBox, Point, point_to_segment_dist, segment_to_segment_dist};
 use crate::optimize::{
     RouteSpatialIndex, find_tapped_segments, is_octilinear, route_wirelength, segment_clear,
@@ -492,7 +492,7 @@ pub fn evaluate_lengths(
 
 /// Inserts DRC-gated octilinear trombone meanders into shorter match-group members.
 pub fn tune_match_groups(board: &Board, routes: &mut [NetRoute], constraints: &LengthConstraints) {
-    tune_match_groups_with_context(board, routes, constraints, None, &|| false);
+    tune_match_groups_with_context(board, routes, constraints, None, None, &|| false);
 }
 
 pub(crate) fn tune_match_groups_with_context(
@@ -500,6 +500,7 @@ pub(crate) fn tune_match_groups_with_context(
     routes: &mut [NetRoute],
     constraints: &LengthConstraints,
     net_components: Option<&[Vec<Vec<Terminal>>]>,
+    target_mask: Option<&[bool]>,
     is_cancelled: &dyn Fn() -> bool,
 ) {
     if constraints.match_groups.is_empty() || is_cancelled() {
@@ -514,7 +515,9 @@ pub(crate) fn tune_match_groups_with_context(
     let mut index = RouteSpatialIndex::build(board, routes);
     let mut qbuf = Vec::new();
     let mut sbuf = Vec::new();
-    let base_drc = check_drc(board, routes).violations.len();
+    let base_drc = check_drc_scoped(board, routes, target_mask)
+        .violations
+        .len();
     let mut local_comps: HashMap<usize, Vec<Vec<Terminal>>> = HashMap::new();
 
     let max_outer = constraints.match_groups.len().min(4);
@@ -552,6 +555,9 @@ pub(crate) fn tune_match_groups_with_context(
             // Tune nets with the largest deficit first so they get priority on open corridors.
             let mut work: Vec<(usize, usize, f64)> = Vec::new();
             for &nid in &member_nids {
+                if target_mask.is_some_and(|m| !m.get(nid).copied().unwrap_or(false)) {
+                    continue;
+                }
                 let Some(&ridx) = route_idx_by_net.get(&nid) else {
                     continue;
                 };
@@ -599,7 +605,10 @@ pub(crate) fn tune_match_groups_with_context(
                 if changed {
                     let new_unconn = count_unconnected_pairs(board, comps, &routes[ridx]);
                     if new_unconn > base_unconn
-                        || check_drc(board, routes).violations.len() > base_drc
+                        || check_drc_scoped(board, routes, target_mask)
+                            .violations
+                            .len()
+                            > base_drc
                     {
                         routes[ridx] = saved;
                         index.update_net(ridx, &routes[ridx]);
