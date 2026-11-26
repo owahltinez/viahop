@@ -353,6 +353,114 @@ impl RoutingGrid {
         v == STATIC_OPEN || v == (net_id as u32) + 1
     }
 
+    /// Rasterizes frozen nets' segments and vias into static obstacle layers owned by `net_id + 1`.
+    pub fn rasterize_frozen_routes(
+        &mut self,
+        board: &Board,
+        routes: &[NetRoute],
+        frozen_mask: &[bool],
+    ) {
+        let has_frozen_copper = routes.iter().any(|nr| {
+            nr.net_id < board.nets.len()
+                && frozen_mask.get(nr.net_id).copied().unwrap_or(false)
+                && !board.nets[nr.net_id].ignored
+                && (!nr.segments.is_empty() || !nr.vias.is_empty())
+        });
+        if !has_frozen_copper {
+            return;
+        }
+
+        let (
+            probe_half_w,
+            probe_clr,
+            probe_via_r,
+            probe_via_drill,
+            _,
+            probe_via_via,
+            probe_via_wire,
+        ) = probe_rules_for_unfrozen(board, frozen_mask);
+        let n2d = self.n2d();
+        let mut static_wire = self.static_wire.to_vec();
+        let mut static_via = self.static_via.to_vec();
+
+        for nr in routes {
+            if nr.net_id >= board.nets.len()
+                || !frozen_mask.get(nr.net_id).copied().unwrap_or(false)
+                || board.nets[nr.net_id].ignored
+                || (nr.segments.is_empty() && nr.vias.is_empty())
+            {
+                continue;
+            }
+            let owner = (nr.net_id as u32) + 1;
+            let rules = &board.nets[nr.net_id].rules;
+            let w_clr = rules.clearance.max(probe_clr);
+            let vw_clr = rules.via_wire.max(probe_via_wire);
+            let vv_clr = rules.via_via.max(probe_via_via);
+
+            for seg in &nr.segments {
+                let half_w = seg.width * 0.5;
+                let wire_thresh = half_w + probe_half_w + w_clr;
+                let via_thresh = half_w + probe_via_r + vw_clr;
+                let wire_thresh_sq = wire_thresh * wire_thresh;
+                let via_thresh_sq = via_thresh * via_thresh;
+                let expand = wire_thresh.max(via_thresh) + 10.0;
+                let (x0, y0, x1, y1) = self.bbox_cells(BBox::from_points(&[seg.a, seg.b], expand));
+                let sig_opt = self.board_to_sig[seg.layer];
+
+                for gy in y0..=y1 {
+                    let y = self.y_of(gy);
+                    let row = gy * self.cols;
+                    for gx in x0..=x1 {
+                        let p = Point::new(self.x_of(gx), y);
+                        let d2 = point_to_segment_dist_sq(p, seg.a, seg.b);
+                        let c2 = row + gx;
+                        if let Some(sl) = sig_opt
+                            && d2 < wire_thresh_sq
+                        {
+                            merge_owner(&mut static_wire[sl * n2d + c2], owner);
+                        }
+                        if d2 < via_thresh_sq {
+                            merge_owner(&mut static_via[c2], owner);
+                        }
+                    }
+                }
+            }
+
+            for via in &nr.vias {
+                let hole_c2c = (via.drill + probe_via_drill) * 0.5 + 205.0;
+                let wire_thresh = via.radius + probe_half_w + vw_clr;
+                let via_thresh = (via.radius + probe_via_r + vv_clr).max(hole_c2c);
+                let wire_thresh_sq = wire_thresh * wire_thresh;
+                let via_thresh_sq = via_thresh * via_thresh;
+                let expand = wire_thresh.max(via_thresh) + 15.0;
+                let (x0, y0, x1, y1) = self.bbox_cells(BBox::from_point(via.pos, expand));
+
+                for gy in y0..=y1 {
+                    let y = self.y_of(gy);
+                    let row = gy * self.cols;
+                    for gx in x0..=x1 {
+                        let p = Point::new(self.x_of(gx), y);
+                        let d2 = p.dist_sq(via.pos);
+                        let c2 = row + gx;
+                        if d2 < wire_thresh_sq {
+                            for (sl, &bl) in self.sig_layers.iter().enumerate() {
+                                if via.layers.contains(&bl) {
+                                    merge_owner(&mut static_wire[sl * n2d + c2], owner);
+                                }
+                            }
+                        }
+                        if d2 < via_thresh_sq {
+                            merge_owner(&mut static_via[c2], owner);
+                        }
+                    }
+                }
+            }
+        }
+
+        self.static_wire = Arc::from(static_wire);
+        self.static_via = Arc::from(static_via);
+    }
+
     pub fn add_footprint(&mut self, board: &Board, route: &NetRoute) -> NetFootprint {
         let rules = &board.nets[route.net_id].rules;
         let wire_r = rules.width + rules.clearance + 4.0;
@@ -563,4 +671,37 @@ fn typical_rules(board: &Board) -> (f64, f64, f64, f64, f64, f64, f64) {
         );
     }
     (50.0, 100.0, 150.0, 180.0, 100.0, 100.0, 100.0)
+}
+
+fn probe_rules_for_unfrozen(
+    board: &Board,
+    frozen_mask: &[bool],
+) -> (f64, f64, f64, f64, f64, f64, f64) {
+    let mut found = false;
+    let mut half_w = f64::INFINITY;
+    let mut clr = f64::INFINITY;
+    let mut via_r = f64::INFINITY;
+    let mut via_drill = f64::INFINITY;
+    let mut via_smd = f64::INFINITY;
+    let mut via_via = f64::INFINITY;
+    let mut via_wire = f64::INFINITY;
+    for n in &board.nets {
+        if n.ignored || n.pad_ids.len() < 2 || frozen_mask.get(n.id).copied().unwrap_or(false) {
+            continue;
+        }
+        found = true;
+        let r = &n.rules;
+        half_w = half_w.min(r.width * 0.5);
+        clr = clr.min(r.clearance);
+        via_r = via_r.min(r.via_radius);
+        via_drill = via_drill.min(r.via_drill);
+        via_smd = via_smd.min(r.via_smd);
+        via_via = via_via.min(r.via_via);
+        via_wire = via_wire.min(r.via_wire);
+    }
+    if found {
+        (half_w, clr, via_r, via_drill, via_smd, via_via, via_wire)
+    } else {
+        typical_rules(board)
+    }
 }

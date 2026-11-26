@@ -112,6 +112,15 @@ impl RouteSpatialIndex {
 
 /// Optimizes routed nets in-place while preserving electrical connectivity and DRC cleanliness.
 pub fn optimize_routes(board: &Board, routes: &mut [NetRoute]) {
+    optimize_routes_subset(board, routes, None);
+}
+
+/// Optimizes routed nets in-place, editing only `target_mask` when set while indexing all nets.
+pub fn optimize_routes_subset(
+    board: &Board,
+    routes: &mut [NetRoute],
+    target_mask: Option<&[bool]>,
+) {
     let mut index = RouteSpatialIndex::build(board, routes);
     let mut qbuf = Vec::new();
     let mut sbuf = Vec::new();
@@ -119,6 +128,11 @@ pub fn optimize_routes(board: &Board, routes: &mut [NetRoute]) {
     for _round in 0..3 {
         let mut any_changed = false;
         for (idx, nr) in routes.iter_mut().enumerate() {
+            if let Some(mask) = target_mask
+                && !mask.get(nr.net_id).copied().unwrap_or(false)
+            {
+                continue;
+            }
             if nr.segments.is_empty() && nr.vias.is_empty() {
                 continue;
             }

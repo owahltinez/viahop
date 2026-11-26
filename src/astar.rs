@@ -15,6 +15,15 @@ pub(crate) struct PassParams {
     pub(crate) max_expansions: usize,
 }
 
+/// Inclusive grid-coordinate bounding box used to clip local A* expansions.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SearchBounds {
+    pub(crate) min_gx: usize,
+    pub(crate) max_gx: usize,
+    pub(crate) min_gy: usize,
+    pub(crate) max_gy: usize,
+}
+
 /// Reusable A* scratch buffers reset in O(1) via generation counters.
 pub(crate) struct SearchScratch {
     g_score: Vec<f32>,
@@ -100,6 +109,7 @@ pub(crate) fn astar_connect(
     existing_vias: &[Point],
     min_via_dist: f64,
     params: &PassParams,
+    bounds: Option<SearchBounds>,
     scratch: &mut SearchScratch,
 ) -> Option<Vec<u32>> {
     scratch.next_search();
@@ -195,8 +205,15 @@ pub(crate) fn astar_connect(
     let max_expansions = params.max_expansions;
     let mut expansions = 0usize;
     let via_base_cost = 6.5_f32;
-    let cols_i = cols as isize;
-    let rows_i = rows as isize;
+    let (min_x, max_x, min_y, max_y) = match bounds {
+        Some(b) => (
+            b.min_gx.min(cols - 1) as isize,
+            b.max_gx.min(cols - 1) as isize,
+            b.min_gy.min(rows - 1) as isize,
+            b.max_gy.min(rows - 1) as isize,
+        ),
+        None => (0, cols as isize - 1, 0, rows as isize - 1),
+    };
 
     while let Some(HeapNode { g, node, .. }) = scratch.heap.pop() {
         let idx = node as usize;
@@ -219,7 +236,7 @@ pub(crate) fn astar_connect(
         for &(dx, dy, dist, is_h, is_v) in &DIRS {
             let nx = gx as isize + dx;
             let ny = gy as isize + dy;
-            if nx < 0 || ny < 0 || nx >= cols_i || ny >= rows_i {
+            if nx < min_x || ny < min_y || nx > max_x || ny > max_y {
                 continue;
             }
             let nxu = nx as usize;

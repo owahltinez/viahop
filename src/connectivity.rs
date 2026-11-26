@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, HashSet};
 
 use crate::board::{Board, NetRoute};
-use crate::drc::check_drc;
+use crate::drc::check_drc_scoped;
 use crate::geometry::{point_to_segment_dist, segment_to_segment_dist};
 use crate::optimize::route_wirelength;
 use crate::router::{Terminal, uf_find};
@@ -49,8 +49,21 @@ impl RouteScore {
 
 /// Evaluates a full board routing using exact continuous DRC and total copper metrics.
 pub fn score_routes(board: &Board, routes: &[NetRoute]) -> (RouteScore, crate::drc::DrcReport) {
-    let drc = check_drc(board, routes);
-    let unconnected_pairs: usize = routes.iter().map(|r| r.unconnected_pairs).sum();
+    score_routes_scoped(board, routes, None)
+}
+
+/// Evaluates routing quality scoped to `target_mask` for unconnected pairs and DRC violations.
+pub(crate) fn score_routes_scoped(
+    board: &Board,
+    routes: &[NetRoute],
+    target_mask: Option<&[bool]>,
+) -> (RouteScore, crate::drc::DrcReport) {
+    let drc = check_drc_scoped(board, routes, target_mask);
+    let unconnected_pairs: usize = routes
+        .iter()
+        .filter(|r| target_mask.is_none_or(|m| m.get(r.net_id).copied().unwrap_or(false)))
+        .map(|r| r.unconnected_pairs)
+        .sum();
     let total_vias: usize = routes.iter().map(|r| r.vias.len()).sum();
     let wirelength_um: f64 = routes.iter().map(route_wirelength).sum();
     let score = RouteScore {

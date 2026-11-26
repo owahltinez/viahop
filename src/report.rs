@@ -214,6 +214,7 @@ fn diagnose_unrouted_pairs(
                         &[],
                         min_via_dist,
                         &params,
+                        None,
                         &mut scratch,
                     );
                     if solo.is_some() {

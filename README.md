@@ -8,7 +8,7 @@ Fast, standalone, zero-dependency, MIT-licensed headless Specctra DSN/SES multi-
 - **Rust library + C-ABI (`rlib` + `cdylib`)**: direct in-process integration from Rust, C/C++, Python `ctypes`, or KiCad plugins (`include/viahop.h`).
 - **Parallel multi-start + bad-pass undo**: start 0 runs canonical ordering with zero overhead when clean; if unrouted pairs or DRC issues remain, shuffled seeds run in parallel and keep the best board while undoing degrading passes.
 - **Atomic checkpointing & graceful stop**: `-do` is updated atomically whenever a better solution is found; `Ctrl+C` (`SIGINT`/`SIGTERM`) or `--max-time` stops cleanly and keeps the best routed `.ses` on disk (a second signal exits immediately).
-- **Initial-session resume (`--initial-session`)**: load an existing `.ses` checkpoint, preserve clean routed nets, finish remaining connections, and run post-route optimization.
+- **Initial-session resume & local reroute (`--initial-session`, `--reroute-nets`)**: load an existing `.ses` checkpoint, preserve clean routed nets, or freeze non-target nets as static obstacles to locally reroute specific nets or net classes within a padded bounding box (`--reroute-pad-mm`).
 - **Structured JSON reports & diagnosis (`--report`, `--diagnose`)**: report every unrouted pair and DRC violation, and test-route each unrouted pair alone on an empty grid to classify `congestion` vs static `blocked` geometry/rules.
 - **Pull-tight & via-reduction optimizer**: spatially indexed multi-segment octilinear shortcutting, inter-via layer flattening (via-pair elimination), collinear merging, redundant via removal, and dangling stub pruning gated by exact continuous DRC.
 - **Full KiCad 10 Specctra DSN/SES + POFV BGA fanout**: handles `um`/`mil`/`mm` resolutions, signal vs power layers, `(plane ...)` zones, board boundary polygons, structure and image keepouts, front/back placement mirroring and rotation, fixed wires/vias, per-class clearances, and centered POFV via-in-pad fanout for dense `0.40 mm` / `0.50 mm` BGAs.
@@ -42,6 +42,9 @@ viahop -i board.dsn -o board.ses --threads 4 --multi-start=4 --max-time=60 --rep
 
 # Resume and optimize from an existing session checkpoint
 viahop -i board.dsn -o board_opt.ses --initial-session board.ses --max-passes 10
+
+# Locally rip up and reroute specific nets while freezing all other nets
+viahop -i board.dsn -o board_fix.ses --initial-session board.ses --reroute-nets CLK,CS --reroute-pad-mm 4.0
 ```
 
 Flags:
@@ -50,6 +53,8 @@ Flags:
 - `--max-passes <N>` (alias: `-mp`): max rip-up-and-reroute passes per start (default `20`)
 - `--multi-start <N>`: parallel shuffled starts if unrouted pairs or DRC issues remain (default `4`)
 - `--initial-session <FILE>`: resume routing/optimization from an existing `.ses` file
+- `--reroute-nets <LIST>`: comma-separated target net or class names to reroute while freezing other nets (repeatable)
+- `--reroute-pad-mm <MM>`: local search bbox padding in mm around rerouted nets (default `4.0` with `--initial-session`)
 - `--report <FILE>`: write detailed JSON report (stats, unrouted pairs, DRC violations)
 - `--diagnose`: with `--report`, classify unrouted pairs as `congestion` vs `blocked`
 - `--ignore <LIST>` (aliases: `-inc`, `--ignore-net-classes`): comma-separated ignored net classes or net names

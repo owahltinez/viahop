@@ -18,6 +18,8 @@ struct CliArgs {
     output_ses: String,
     rules_file: Option<String>,
     initial_session: Option<String>,
+    reroute_nets: Option<HashSet<String>>,
+    reroute_pad_mm: Option<f64>,
     report_file: Option<String>,
     diagnose: bool,
     max_passes: usize,
@@ -69,6 +71,8 @@ fn parse_args(args: &[String]) -> Result<Action, String> {
     let mut output_ses: Option<String> = None;
     let mut rules_file: Option<String> = None;
     let mut initial_session: Option<String> = None;
+    let mut reroute_nets: Option<HashSet<String>> = None;
+    let mut reroute_pad_mm: Option<f64> = None;
     let mut report_file: Option<String> = None;
     let mut diagnose = false;
     let mut max_passes: usize = 20;
@@ -103,6 +107,31 @@ fn parse_args(args: &[String]) -> Result<Action, String> {
             "-o" | "-do" | "--output" => output_ses = Some(next_val(&mut i, flag, inline_val)?),
             "-dr" | "--rules" => rules_file = Some(next_val(&mut i, flag, inline_val)?),
             "--initial-session" => initial_session = Some(next_val(&mut i, flag, inline_val)?),
+            "--reroute-nets" => {
+                let v = next_val(&mut i, flag, inline_val)?;
+                let set = reroute_nets.get_or_insert_with(HashSet::new);
+                let mut added = 0;
+                for item in v.split(',') {
+                    let trimmed = item.trim();
+                    if !trimmed.is_empty() {
+                        set.insert(trimmed.to_string());
+                        added += 1;
+                    }
+                }
+                if added == 0 {
+                    return Err(format!("{flag} requires at least one net or class name"));
+                }
+            }
+            "--reroute-pad-mm" => {
+                let v = next_val(&mut i, flag, inline_val)?;
+                let mm = v
+                    .parse::<f64>()
+                    .map_err(|_| format!("invalid positive number for {flag}: {v}"))?;
+                if !mm.is_finite() || mm <= 0.0 {
+                    return Err(format!("{flag} must be a positive number: {v}"));
+                }
+                reroute_pad_mm = Some(mm);
+            }
             "--report" => report_file = Some(next_val(&mut i, flag, inline_val)?),
             "--diagnose" => diagnose = true,
             "-mp" | "--max-passes" => {
@@ -158,6 +187,8 @@ fn parse_args(args: &[String]) -> Result<Action, String> {
         output_ses,
         rules_file,
         initial_session,
+        reroute_nets,
+        reroute_pad_mm,
         report_file,
         diagnose,
         max_passes,
@@ -201,6 +232,8 @@ fn run(cli: CliArgs) -> Result<(), String> {
         optimize: true,
         multi_start: cli.multi_start,
         initial_routes,
+        reroute_nets: cli.reroute_nets,
+        reroute_pad_um: cli.reroute_pad_mm.map(|mm| mm * 1000.0),
         stop_flag: None,
     };
 
@@ -265,6 +298,8 @@ OPTIONS:\n  \
   --max-passes <N>             Max rip-up-and-reroute passes per start, default 20 (alias: -mp)\n  \
   --multi-start <N>            Parallel shuffled starts if unrouted remain (default: 4)\n  \
   --initial-session <FILE>     Resume routing/optimization from an existing SES file\n  \
+  --reroute-nets <LIST>        Comma-separated target nets or classes to reroute (repeatable)\n  \
+  --reroute-pad-mm <MM>        Local search padding in mm around rerouted nets (default: 4.0)\n  \
   --report <FILE>              Write detailed JSON report (stats, unrouted, violations)\n  \
   --diagnose                   With --report, classify unrouted pairs (congestion vs blocked)\n  \
   --ignore <LIST>              Comma-separated ignored net classes or nets (alias: -inc)\n  \

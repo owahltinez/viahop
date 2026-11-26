@@ -25,7 +25,18 @@ pub struct DrcReport {
 
 /// Runs an exact continuous-geometry DRC check over all routed segments and vias.
 pub fn check_drc(board: &Board, routes: &[NetRoute]) -> DrcReport {
+    check_drc_scoped(board, routes, None)
+}
+
+/// Runs exact continuous-geometry DRC, restricting checks to violations involving `target_mask`.
+pub(crate) fn check_drc_scoped(
+    board: &Board,
+    routes: &[NetRoute],
+    target_mask: Option<&[bool]>,
+) -> DrcReport {
     let mut report = DrcReport::default();
+    let is_target =
+        |nid: usize| -> bool { target_mask.is_none_or(|m| m.get(nid).copied().unwrap_or(false)) };
 
     let mut all_segs: Vec<(usize, &RoutedSegment, BBox)> = Vec::new();
     let mut all_vias: Vec<(usize, &RoutedVia, BBox)> = Vec::new();
@@ -49,11 +60,25 @@ pub fn check_drc(board: &Board, routes: &[NetRoute]) -> DrcReport {
         via_grid.insert(i, bb);
     }
 
+    let max_board_clr = board
+        .nets
+        .iter()
+        .map(|n| n.rules.clearance)
+        .fold(0.0_f64, f64::max);
+    let max_board_vclr = board
+        .nets
+        .iter()
+        .map(|n| n.rules.via_via.max(n.rules.via_wire))
+        .fold(220.0_f64, f64::max);
+
     let mut buf = Vec::new();
     let mut static_buf = Vec::new();
 
-    // 1. Check routed segments against static obstacles & other routed segments.
+    // 1. Check routed segments against static obstacles, other routed segments, and non-target vias.
     for (idx, &(net_a, seg, bb)) in all_segs.iter().enumerate() {
+        if !is_target(net_a) {
+            continue;
+        }
         let half_w = seg.width * 0.5;
         if !board.check_segment_static_with_buf(
             net_a,
@@ -76,13 +101,14 @@ pub fn check_drc(board: &Board, routes: &[NetRoute]) -> DrcReport {
             });
         }
 
-        let max_clr = board.nets[net_a].rules.clearance + 50.0;
+        let max_clr = board.nets[net_a].rules.clearance.max(max_board_clr) + 50.0;
         seg_grid.query(bb.expand(max_clr), &mut buf);
         for &j in &buf {
-            if j <= idx {
+            let (net_b, seg_b, _) = all_segs[j];
+            let b_target = is_target(net_b);
+            if b_target && j <= idx {
                 continue;
             }
-            let (net_b, seg_b, _) = all_segs[j];
             if net_a == net_b || seg.layer != seg_b.layer {
                 continue;
             }
@@ -92,7 +118,9 @@ pub fn check_drc(board: &Board, routes: &[NetRoute]) -> DrcReport {
                 - seg_b.width * 0.5;
             if gap < req - 0.5 {
                 report.conflicting_nets.insert(net_a);
-                report.conflicting_nets.insert(net_b);
+                if b_target {
+                    report.conflicting_nets.insert(net_b);
+                }
                 report.violations.push(DrcViolation {
                     net_a,
                     net_b: Some(net_b),
@@ -104,10 +132,42 @@ pub fn check_drc(board: &Board, routes: &[NetRoute]) -> DrcReport {
                 });
             }
         }
+
+        if target_mask.is_some() {
+            let max_vw = board.nets[net_a].rules.via_wire.max(max_board_vclr) + 50.0;
+            via_grid.query(bb.expand(max_vw), &mut buf);
+            for &j in &buf {
+                let (net_b, via_b, _) = all_vias[j];
+                if is_target(net_b) || net_a == net_b || !via_b.layers.contains(&seg.layer) {
+                    continue;
+                }
+                let req = board.via_to_wire_clearance(net_b, Some(net_a));
+                let sh = Shape::Circle {
+                    center: via_b.pos,
+                    radius: via_b.radius,
+                };
+                let gap = sh.dist_to_capsule(seg.a, seg.b, half_w);
+                if gap < req - 0.5 {
+                    report.conflicting_nets.insert(net_a);
+                    report.violations.push(DrcViolation {
+                        net_a: net_b,
+                        net_b: Some(net_a),
+                        layer: Some(seg.layer),
+                        pos: via_b.pos,
+                        kind: "via_seg",
+                        gap_um: gap,
+                        required_um: req,
+                    });
+                }
+            }
+        }
     }
 
     // 2. Check routed vias against static obstacles, other routed vias, and other routed segments.
     for (idx, &(net_a, via, bb)) in all_vias.iter().enumerate() {
+        if !is_target(net_a) {
+            continue;
+        }
         if !board.check_via_static_with_buf(net_a, via.pos, -0.5, &mut static_buf) {
             report.conflicting_nets.insert(net_a);
             report.violations.push(DrcViolation {
@@ -125,14 +185,15 @@ pub fn check_drc(board: &Board, routes: &[NetRoute]) -> DrcReport {
             .rules
             .via_via
             .max(board.nets[net_a].rules.via_wire)
-            .max(220.0)
+            .max(max_board_vclr)
             + 50.0;
         via_grid.query(bb.expand(max_vclr), &mut buf);
         for &j in &buf {
-            if j <= idx {
+            let (net_b, via_b, _) = all_vias[j];
+            let b_target = is_target(net_b);
+            if b_target && j <= idx {
                 continue;
             }
-            let (net_b, via_b, _) = all_vias[j];
             if !via.layers.iter().any(|l| via_b.layers.contains(l)) {
                 continue;
             }
@@ -157,7 +218,9 @@ pub fn check_drc(board: &Board, routes: &[NetRoute]) -> DrcReport {
             let gap = dist - via.radius - via_b.radius;
             if gap < req - 0.5 || dist < min_hole_c2c - 0.5 {
                 report.conflicting_nets.insert(net_a);
-                report.conflicting_nets.insert(net_b);
+                if b_target {
+                    report.conflicting_nets.insert(net_b);
+                }
                 report.violations.push(DrcViolation {
                     net_a,
                     net_b: Some(net_b),
@@ -184,7 +247,9 @@ pub fn check_drc(board: &Board, routes: &[NetRoute]) -> DrcReport {
             let gap = sh.dist_to_capsule(seg_b.a, seg_b.b, seg_b.width * 0.5);
             if gap < req - 0.5 {
                 report.conflicting_nets.insert(net_a);
-                report.conflicting_nets.insert(net_b);
+                if is_target(net_b) {
+                    report.conflicting_nets.insert(net_b);
+                }
                 report.violations.push(DrcViolation {
                     net_a,
                     net_b: Some(net_b),
