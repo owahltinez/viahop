@@ -171,6 +171,21 @@ impl Shape {
         }
     }
 
+    /// Minimum distance from this shape's copper to the edges of polygon `verts`.
+    pub fn dist_to_polygon_edge(&self, verts: &[Point]) -> f64 {
+        match self {
+            Self::Circle { center, radius } => point_to_polygon_edge_dist(*center, verts) - radius,
+            Self::Capsule { a, b, radius } => segment_to_polygon_edge_dist(*a, *b, verts) - radius,
+            Self::Poly { verts: pv, .. } => match pv.len() {
+                0 => f64::INFINITY,
+                1 => point_to_polygon_edge_dist(pv[0], verts),
+                _ => (0..pv.len())
+                    .map(|i| segment_to_polygon_edge_dist(pv[i], pv[(i + 1) % pv.len()], verts))
+                    .fold(f64::INFINITY, f64::min),
+            },
+        }
+    }
+
     /// Transforms a shape in component-local coordinates to world coordinates.
     pub fn transform(&self, flip_x: bool, rot_deg: f64, origin: Point) -> Self {
         match self {
@@ -332,14 +347,41 @@ pub fn point_to_polygon_edge_dist(p: Point, verts: &[Point]) -> f64 {
     min_sq.sqrt()
 }
 
-pub fn segment_to_polygon_dist(a: Point, b: Point, verts: &[Point]) -> f64 {
-    if verts.is_empty() {
+/// Returns the closest point on the boundary edges of polygon `verts` to `p`.
+pub fn closest_point_on_polygon_edge(p: Point, verts: &[Point]) -> Option<Point> {
+    let n = verts.len();
+    if n < 2 {
+        return None;
+    }
+    let mut best_sq = f64::INFINITY;
+    let mut best_pt = verts[0];
+    for i in 0..n {
+        let a = verts[i];
+        let b = verts[(i + 1) % n];
+        let abx = b.x - a.x;
+        let aby = b.y - a.y;
+        let len_sq = abx * abx + aby * aby;
+        let proj = if len_sq <= 1e-18 {
+            a
+        } else {
+            let t = (((p.x - a.x) * abx + (p.y - a.y) * aby) / len_sq).clamp(0.0, 1.0);
+            Point::new(a.x + t * abx, a.y + t * aby)
+        };
+        let d_sq = p.dist_sq(proj);
+        if d_sq < best_sq {
+            best_sq = d_sq;
+            best_pt = proj;
+        }
+    }
+    Some(best_pt)
+}
+
+/// Minimum distance from segment `(a, b)` to the boundary edges of polygon `verts`.
+pub fn segment_to_polygon_edge_dist(a: Point, b: Point, verts: &[Point]) -> f64 {
+    let n = verts.len();
+    if n < 2 {
         return f64::INFINITY;
     }
-    if point_in_polygon(a, verts) || point_in_polygon(b, verts) {
-        return 0.0;
-    }
-    let n = verts.len();
     let mut min_d = f64::INFINITY;
     for i in 0..n {
         let e1 = verts[i];
@@ -351,6 +393,15 @@ pub fn segment_to_polygon_dist(a: Point, b: Point, verts: &[Point]) -> f64 {
         min_d = min_d.min(d);
     }
     min_d
+}
+
+pub fn segment_to_polygon_dist(a: Point, b: Point, verts: &[Point]) -> f64 {
+    match verts.len() {
+        0 => f64::INFINITY,
+        1 => point_to_segment_dist(verts[0], a, b),
+        _ if point_in_polygon(a, verts) || point_in_polygon(b, verts) => 0.0,
+        _ => segment_to_polygon_edge_dist(a, b, verts),
+    }
 }
 
 #[cfg(test)]

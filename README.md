@@ -10,8 +10,8 @@ Fast, standalone, zero-dependency, MIT-licensed headless Specctra DSN/SES multi-
 - **Atomic checkpointing & graceful stop**: `-do` is updated atomically whenever a better solution is found; `Ctrl+C` (`SIGINT`/`SIGTERM`) or `--max-time` stops cleanly and keeps the best routed `.ses` on disk (a second signal exits immediately).
 - **Initial-session resume (`--initial-session`)**: load an existing `.ses` checkpoint, preserve clean routed nets, finish remaining connections, and run post-route optimization.
 - **Structured JSON reports & diagnosis (`--report`, `--diagnose`)**: report every unrouted pair and DRC violation, and test-route each unrouted pair alone on an empty grid to classify `congestion` vs static `blocked` geometry/rules.
-- **Pull-tight & via-reduction optimizer**: spatially indexed multi-segment octilinear shortcutting, inter-via layer flattening (via-pair elimination), collinear merging, redundant via removal, and dangling stub pruning gated by exact continuous DRC.
-- **Full KiCad 10 Specctra DSN/SES + POFV BGA fanout**: handles `um`/`mil`/`mm` resolutions, signal vs power layers, `(plane ...)` zones, board boundary polygons, structure and image keepouts, front/back placement mirroring and rotation, fixed wires/vias, per-class clearances, and centered POFV via-in-pad fanout for dense `0.40 mm` / `0.50 mm` BGAs.
+- **Pull-tight, POFV snapping & clean SES hygiene**: spatially indexed multi-segment octilinear shortcutting, inter-via layer flattening (via-pair elimination), collinear merging, centered POFV via snapping, T-junction/via-tap segment splitting, dead single-layer via pruning, and dangling stub pruning gated by zero-slack continuous DRC.
+- **Full KiCad 10 Specctra DSN/SES + DRC parity**: handles `um`/`mil`/`mm` resolutions, signal vs power layers, signal-layer `(plane ...)` polygon obstacles, board boundary polygons with configurable `--edge-clearance`, configurable drill `--hole-to-hole` clearance, structure and image keepouts, front/back placement mirroring and rotation, fixed wires/vias, per-class clearances, and centered POFV via-in-pad fanout for dense `0.40 mm` / `0.50 mm` BGAs.
 
 ## Install & Build
 
@@ -57,6 +57,8 @@ Flags:
 - `--rules <FILE>` (alias: `-dr`): optional Specctra rules file
 - `-q`, `--quiet` (aliases: `-dl`, `--disable-log`): suppress stderr summary
 - `--via-at-smd` / `--no-via-at-smd`: override DSN POFV via-in-pad setting
+- `--hole-to-hole <UM>`: minimum drill hole-to-hole clearance in micrometers (overrides `.rules`, default `200`)
+- `--edge-clearance <UM>`: minimum copper-to-board-edge clearance in micrometers (overrides `.rules`)
 - `--timeout`, `--max-time <SECS>`: soft timeout in seconds
 - `--json-summary`: emit JSON metrics to stdout
 - `-h`/`--help`, `-V`/`--version`

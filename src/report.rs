@@ -184,8 +184,7 @@ fn diagnose_unrouted_pairs(
             })
             .collect();
         let mst_edges = build_mst(&cluster_terms);
-        let rules = &net.rules;
-        let min_via_dist = (2.0 * rules.via_radius + rules.via_via).max(rules.via_drill + 205.0);
+        let min_via_dist = board.min_via_spacing(net.id);
 
         for (ca, cb) in mst_edges {
             let (ta, tb) = closest_terminals(&cluster_terms[ca], &cluster_terms[cb]);

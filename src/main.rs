@@ -9,7 +9,7 @@ use std::process::ExitCode;
 use std::sync::Mutex;
 
 use viahop::{
-    Board, DsnDesign, RouteReport, RouteScore, RouterConfig, parse_ses,
+    Board, BoardOptions, DsnDesign, RouteReport, RouteScore, RouterConfig, parse_ses,
     route_board_with_checkpoint, ses, signal,
 };
 
@@ -25,6 +25,8 @@ struct CliArgs {
     ignored_nets: HashSet<String>,
     threads: usize,
     via_at_smd: Option<bool>,
+    hole_to_hole_um: Option<f64>,
+    edge_clearance_um: Option<f64>,
     timeout_secs: Option<u64>,
     disable_log: bool,
     json_summary: bool,
@@ -76,6 +78,8 @@ fn parse_args(args: &[String]) -> Result<Action, String> {
     let mut ignored_nets = HashSet::new();
     let mut threads: usize = 1;
     let mut via_at_smd: Option<bool> = None;
+    let mut hole_to_hole_um: Option<f64> = None;
+    let mut edge_clearance_um: Option<f64> = None;
     let mut timeout_secs: Option<u64> = None;
     let mut disable_log = false;
     let mut json_summary = false;
@@ -137,6 +141,14 @@ fn parse_args(args: &[String]) -> Result<Action, String> {
             "-q" | "-dl" | "--quiet" | "--disable-log" => disable_log = true,
             "--via-at-smd" => via_at_smd = Some(true),
             "--no-via-at-smd" => via_at_smd = Some(false),
+            "--hole-to-hole" => {
+                let v = next_val(&mut i, flag, inline_val)?;
+                hole_to_hole_um = Some(parse_non_negative_f64(flag, &v)?);
+            }
+            "--edge-clearance" => {
+                let v = next_val(&mut i, flag, inline_val)?;
+                edge_clearance_um = Some(parse_non_negative_f64(flag, &v)?);
+            }
             "--timeout" | "--max-time" => {
                 let v = next_val(&mut i, flag, inline_val)?;
                 timeout_secs = Some(
@@ -165,10 +177,24 @@ fn parse_args(args: &[String]) -> Result<Action, String> {
         ignored_nets,
         threads,
         via_at_smd,
+        hole_to_hole_um,
+        edge_clearance_um,
         timeout_secs,
         disable_log,
         json_summary,
     })))
+}
+
+fn parse_non_negative_f64(flag: &str, v: &str) -> Result<f64, String> {
+    let val = v
+        .parse::<f64>()
+        .map_err(|_| format!("invalid number for {flag}: {v}"))?;
+    if !val.is_finite() || val < 0.0 {
+        return Err(format!(
+            "{flag} must be a non-negative finite number, got: {v}"
+        ));
+    }
+    Ok(val)
 }
 
 fn run(cli: CliArgs) -> Result<(), String> {
@@ -183,7 +209,12 @@ fn run(cli: CliArgs) -> Result<(), String> {
         design.apply_rules_file(&rules_text)?;
     }
 
-    let board = Board::from_dsn(&design, &cli.ignored_nets, cli.via_at_smd)?;
+    let board_opts = BoardOptions {
+        hole_to_hole_um: cli.hole_to_hole_um,
+        edge_clearance_um: cli.edge_clearance_um,
+    };
+    let board =
+        Board::from_dsn_with_options(&design, &cli.ignored_nets, cli.via_at_smd, board_opts)?;
     let initial_routes = if let Some(ref ses_path) = cli.initial_session {
         let ses_text = fs::read_to_string(ses_path)
             .map_err(|e| format!("failed to read initial session {ses_path}: {e}"))?;
@@ -196,6 +227,8 @@ fn run(cli: CliArgs) -> Result<(), String> {
         max_passes: cli.max_passes,
         ignored_nets: cli.ignored_nets,
         via_at_smd: cli.via_at_smd,
+        hole_to_hole_um: cli.hole_to_hole_um,
+        edge_clearance_um: cli.edge_clearance_um,
         threads: cli.threads,
         timeout_secs: cli.timeout_secs,
         optimize: true,
@@ -272,6 +305,8 @@ OPTIONS:\n  \
   --rules <FILE>               Optional Specctra rules file (alias: -dr)\n  \
   -q, --quiet                  Suppress stderr summary (alias: -dl)\n  \
   --via-at-smd / --no-via-at-smd  Override DSN POFV (via-in-pad) setting\n  \
+  --hole-to-hole <UM>          Minimum drill hole-to-hole clearance in um (default: 200)\n  \
+  --edge-clearance <UM>        Minimum copper-to-board-edge clearance in um\n  \
   --timeout, --max-time <SECS> Soft timeout in seconds (writes best board so far)\n  \
   --json-summary               Print JSON routing summary to stdout\n  \
   -h, --help                   Show this help message\n  \

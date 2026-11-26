@@ -41,6 +41,9 @@ pub struct RoutingGrid {
     pub wire_hist: Vec<f32>,
     pub via_occ: Vec<u16>,
     pub via_hist: Vec<f32>,
+    pub(crate) max_half_w: f64,
+    max_via_r: f64,
+    max_via_drill: f64,
 }
 
 impl RoutingGrid {
@@ -68,12 +71,17 @@ impl RoutingGrid {
 
         let (def_half_w, def_clr, def_via_r, def_via_drill, def_via_smd, def_via_via, def_via_wire) =
             typical_rules(board);
+        let (max_half_w, max_via_r, max_via_drill) =
+            max_routable_dims(board, def_half_w, def_via_r, def_via_drill);
 
-        // 1. Mark cells outside board boundary (with conservative 265um edge clearance).
+        // 1. Mark cells outside board boundary (honoring configured edge clearance).
         if board.boundary.len() >= 3 {
-            let edge_clr = def_clr.max(265.0);
-            let wire_edge_margin = def_half_w + edge_clr;
-            let via_edge_margin = def_via_r + edge_clr;
+            let edge_clr = board.edge_clearance_um.map_or_else(
+                || def_clr.max(265.0),
+                |ec| if ec > 0.0 { ec + 5.0 } else { 0.0 },
+            );
+            let wire_edge_margin = max_half_w + edge_clr;
+            let via_edge_margin = max_via_r + edge_clr;
             let mut row_wire_blocked = vec![false; n2d];
             let mut row_via_blocked = vec![false; n2d];
             let worker_count = threads.clamp(1, 8).min(rows.max(1));
@@ -135,29 +143,30 @@ impl RoutingGrid {
             (gx0, gy0, gx1, gy1)
         };
 
-        // 2. Rasterize keepouts (structure cutouts carry extra margin for curved Edge.Cuts clearance).
+        // 2. Rasterize keepouts (structure cutouts honor edge clearance + 5um buffer, min 150um).
+        let cutout_margin = board.edge_clearance_um.unwrap_or(145.0).max(145.0) + 5.0;
         for k in &board.keepouts {
             let block_wire = k.kind != crate::dsn::KeepoutKind::Via;
             let block_via = k.kind != crate::dsn::KeepoutKind::Wire;
             let k_margin = if k.is_structure && k.kind == crate::dsn::KeepoutKind::All {
-                150.0
+                cutout_margin
             } else {
                 10.0
             };
-            let (x0, y0, x1, y1) = bbox_cells(k.bbox.expand(def_via_r + k_margin + 30.0));
+            let (x0, y0, x1, y1) = bbox_cells(k.bbox.expand(max_via_r + k_margin + 30.0));
             for gy in y0..=y1 {
                 let y = origin_y + gy as f64 * step;
                 for gx in x0..=x1 {
                     let p = Point::new(origin_x + gx as f64 * step, y);
                     let c2 = gy * cols + gx;
-                    if block_wire && k.shape.dist_to_circle(p, def_half_w) < k_margin {
+                    if block_wire && k.shape.dist_to_circle(p, max_half_w) < k_margin {
                         for (sl, &bl) in sig_layers.iter().enumerate() {
                             if k.applies_to_layer(bl) {
                                 static_wire[sl * n2d + c2] = STATIC_BLOCKED;
                             }
                         }
                     }
-                    if block_via && k.shape.dist_to_circle(p, def_via_r) < k_margin {
+                    if block_via && k.shape.dist_to_circle(p, max_via_r) < k_margin {
                         static_via[c2] = STATIC_BLOCKED;
                     }
                 }
@@ -212,38 +221,7 @@ impl RoutingGrid {
             }
         }
 
-        // 4. Rasterize fixed wires.
-        for fs in &board.fixed_segments {
-            let owner = fs.net_id.map_or(STATIC_BLOCKED, |id| (id as u32) + 1);
-            let w_clr = fs
-                .net_id
-                .map_or(def_clr, |id| board.nets[id].rules.clearance.max(def_clr));
-            let v_clr = fs.net_id.map_or(def_via_wire, |id| {
-                board.nets[id].rules.via_wire.max(def_via_wire)
-            });
-            let expand = def_via_r + v_clr.max(w_clr) + def_half_w + 10.0;
-            let (x0, y0, x1, y1) = bbox_cells(fs.bbox.expand(expand));
-            let sig_opt = board_to_sig[fs.layer];
-
-            for gy in y0..=y1 {
-                let y = origin_y + gy as f64 * step;
-                for gx in x0..=x1 {
-                    let p = Point::new(origin_x + gx as f64 * step, y);
-                    let d = point_to_segment_dist(p, fs.a, fs.b) - fs.half_w;
-                    let c2 = gy * cols + gx;
-                    if let Some(sl) = sig_opt
-                        && d - def_half_w < w_clr
-                    {
-                        merge_owner(&mut static_wire[sl * n2d + c2], owner);
-                    }
-                    if d - def_via_r < v_clr {
-                        merge_owner(&mut static_via[c2], owner);
-                    }
-                }
-            }
-        }
-
-        // 5. Rasterize fixed vias.
+        // 4. Rasterize fixed vias.
         for fv in &board.fixed_vias {
             let owner = fv.net_id.map_or(STATIC_BLOCKED, |id| (id as u32) + 1);
             let vw_clr = fv.net_id.map_or(def_via_wire, |id| {
@@ -252,8 +230,8 @@ impl RoutingGrid {
             let vv_clr = fv.net_id.map_or(def_via_via, |id| {
                 board.nets[id].rules.via_via.max(def_via_via)
             });
-            let hole_c2c = (fv.drill + def_via_drill) * 0.5 + 205.0;
-            let expand = (fv.radius + def_via_r + vv_clr.max(vw_clr)).max(hole_c2c) + 15.0;
+            let hole_c2c = (fv.drill + max_via_drill) * 0.5 + board.hole_to_hole_um + 5.0;
+            let expand = (fv.radius + max_via_r + vv_clr.max(vw_clr)).max(hole_c2c) + 15.0;
             let (x0, y0, x1, y1) = bbox_cells(BBox::from_point(fv.pos, expand));
 
             for gy in y0..=y1 {
@@ -270,7 +248,7 @@ impl RoutingGrid {
                             }
                         }
                     }
-                    if d - def_via_r < vv_clr || center_d < hole_c2c {
+                    if d - max_via_r < vv_clr || center_d < hole_c2c {
                         let via_owner = if center_d < 5.0 {
                             owner
                         } else {
@@ -280,6 +258,50 @@ impl RoutingGrid {
                     }
                 }
             }
+        }
+
+        // 5. Rasterize fixed wires and signal-layer planes with shared copper-clearance logic.
+        let mut rasterize_copper =
+            |layer: usize, net_id: Option<usize>, bbox: BBox, dist_fn: &dyn Fn(Point) -> f64| {
+                let owner = net_id.map_or(STATIC_BLOCKED, |id| (id as u32) + 1);
+                let w_clr =
+                    net_id.map_or(def_clr, |id| board.nets[id].rules.clearance.max(def_clr));
+                let v_clr = net_id.map_or(def_via_wire, |id| {
+                    board.nets[id].rules.via_wire.max(def_via_wire)
+                });
+                let expand = def_via_r + v_clr.max(w_clr) + def_half_w + 10.0;
+                let (x0, y0, x1, y1) = bbox_cells(bbox.expand(expand));
+                let sig_opt = board_to_sig[layer];
+                for gy in y0..=y1 {
+                    let y = origin_y + gy as f64 * step;
+                    for gx in x0..=x1 {
+                        let p = Point::new(origin_x + gx as f64 * step, y);
+                        let d = dist_fn(p);
+                        let c2 = gy * cols + gx;
+                        if let Some(sl) = sig_opt
+                            && d - def_half_w < w_clr
+                        {
+                            merge_owner(&mut static_wire[sl * n2d + c2], owner);
+                        }
+                        if d - def_via_r < v_clr {
+                            merge_owner(&mut static_via[c2], owner);
+                        }
+                    }
+                }
+            };
+
+        for fs in &board.fixed_segments {
+            rasterize_copper(fs.layer, fs.net_id, fs.bbox, &|p| {
+                point_to_segment_dist(p, fs.a, fs.b) - fs.half_w
+            });
+        }
+        for fp in &board.planes {
+            if board_to_sig[fp.layer].is_none() {
+                continue;
+            }
+            rasterize_copper(fp.layer, fp.net_id, fp.bbox, &|p| {
+                fp.shape.dist_to_circle(p, 0.0)
+            });
         }
 
         Self {
@@ -296,6 +318,9 @@ impl RoutingGrid {
             wire_hist: vec![0.0; n3d],
             via_occ: vec![0; n2d],
             via_hist: vec![0.0; n2d],
+            max_half_w,
+            max_via_r,
+            max_via_drill,
         }
     }
 
@@ -357,12 +382,15 @@ impl RoutingGrid {
         let rules = &board.nets[route.net_id].rules;
         let wire_r = rules.width + rules.clearance + 4.0;
         let via_wire_r = rules.via_radius + rules.width * 0.5 + rules.via_wire + 4.0;
-        let via_via_r = (2.0 * rules.via_radius + rules.via_via).max(rules.via_drill + 205.0) + 4.0;
+        let via_via_r = board
+            .min_via_spacing(route.net_id)
+            .max(rules.via_radius + self.max_via_r + rules.via_via)
+            .max((rules.via_drill + self.max_via_drill) * 0.5 + board.hole_to_hole_um + 5.0)
+            + 4.0;
         let n2d = self.n2d();
 
         let wire_r_sq = wire_r * wire_r;
         let via_wire_r_sq = via_wire_r * via_wire_r;
-        let via_via_r_sq = via_via_r * via_via_r;
         let center_r_sq = (self.step * 0.55) * (self.step * 0.55);
 
         let mut wire_halo = Vec::new();
@@ -401,7 +429,13 @@ impl RoutingGrid {
             let (vgx, vgy) = self.snap(via.pos);
             via_centers.push((vgy * self.cols + vgx) as u32);
 
-            let bb = BBox::from_point(via.pos, via_via_r.max(via_wire_r));
+            let v_wire_r = via_wire_r.max(via.radius + rules.width * 0.5 + rules.via_wire + 4.0);
+            let v_via_r = via_via_r
+                .max(via.radius + self.max_via_r + rules.via_via + 4.0)
+                .max((via.drill + self.max_via_drill) * 0.5 + board.hole_to_hole_um + 9.0);
+            let v_wire_r_sq = v_wire_r * v_wire_r;
+            let v_via_r_sq = v_via_r * v_via_r;
+            let bb = BBox::from_point(via.pos, v_via_r.max(v_wire_r));
             let (x0, y0, x1, y1) = self.bbox_cells(bb);
             for gy in y0..=y1 {
                 let y = self.y_of(gy);
@@ -410,14 +444,14 @@ impl RoutingGrid {
                     let p = Point::new(self.x_of(gx), y);
                     let d2 = p.dist_sq(via.pos);
                     let c2 = row + gx;
-                    if d2 < via_wire_r_sq {
+                    if d2 < v_wire_r_sq {
                         for (sl, &bl) in self.sig_layers.iter().enumerate() {
                             if via.layers.contains(&bl) {
                                 wire_halo.push((sl * n2d + c2) as u32);
                             }
                         }
                     }
-                    if d2 < via_via_r_sq {
+                    if d2 < v_via_r_sq {
                         via_halo.push(c2 as u32);
                     }
                 }
@@ -547,6 +581,24 @@ fn choose_grid_step(board: &Board) -> f64 {
         }
     }
     500.0
+}
+
+fn max_routable_dims(
+    board: &Board,
+    def_half_w: f64,
+    def_via_r: f64,
+    def_via_drill: f64,
+) -> (f64, f64, f64) {
+    board.nets.iter().filter(|n| !n.ignored).fold(
+        (def_half_w, def_via_r, def_via_drill),
+        |(hw, vr, vd), n| {
+            (
+                hw.max(n.rules.width * 0.5),
+                vr.max(n.rules.via_radius),
+                vd.max(n.rules.via_drill),
+            )
+        },
+    )
 }
 
 fn typical_rules(board: &Board) -> (f64, f64, f64, f64, f64, f64, f64) {

@@ -26,6 +26,10 @@ pub struct RouterConfig {
     pub ignored_nets: HashSet<String>,
     /// Override DSN `(via_at_smd on|off)` when `Some`.
     pub via_at_smd: Option<bool>,
+    /// Optional drill hole-to-hole clearance override in micrometers.
+    pub hole_to_hole_um: Option<f64>,
+    /// Optional copper-to-board-edge clearance override in micrometers.
+    pub edge_clearance_um: Option<f64>,
     pub threads: usize,
     pub timeout_secs: Option<u64>,
     pub optimize: bool,
@@ -44,6 +48,8 @@ impl Default for RouterConfig {
             max_passes: 20,
             ignored_nets: HashSet::new(),
             via_at_smd: None,
+            hole_to_hole_um: None,
+            edge_clearance_um: None,
             threads: 1,
             timeout_secs: None,
             optimize: true,
@@ -610,6 +616,8 @@ where
 
     count_all_unconnected(board, net_components, &mut routes, routable_nets);
     let (pre_score, _) = score_routes(board, &routes);
+    let mut need_finalize = !config.optimize;
+    best_score = pre_score;
     if config.optimize {
         let pre_opt = routes.clone();
         crate::optimize::optimize_routes(board, &mut routes);
@@ -622,10 +630,25 @@ where
             notify_best(&routes, best_score);
         } else {
             routes = pre_opt;
-            best_score = pre_score;
+            need_finalize = true;
         }
-    } else {
-        best_score = pre_score;
+    }
+
+    if need_finalize {
+        let pre_fin = routes.clone();
+        crate::optimize::finalize_routes(board, &mut routes);
+        count_all_unconnected(board, net_components, &mut routes, routable_nets);
+        let (final_score, _) = score_routes(board, &routes);
+        if final_score.unconnected_pairs <= best_score.unconnected_pairs
+            && final_score.drc_violations <= best_score.drc_violations
+        {
+            if final_score.is_better_than(best_score) {
+                notify_best(&routes, final_score);
+            }
+            best_score = final_score;
+        } else {
+            routes = pre_fin;
+        }
     }
 
     StartOutcome {
@@ -680,7 +703,7 @@ fn route_single_net(
             continue;
         }
 
-        let min_via_dist = (2.0 * rules.via_radius + rules.via_via).max(rules.via_drill + 205.0);
+        let min_via_dist = board.min_via_spacing(net_id);
         let path_opt = astar_connect(
             grid,
             net_id,
@@ -981,7 +1004,10 @@ fn compute_terminal_entries(
             if primary_pad_layer.is_none() {
                 primary_pad_layer = Some(bl);
             }
-            entries.push((sl, gx, gy, None, bl));
+            let layer_start = entries.len();
+            if grid.wire_allowed(sl, c2, net_id) {
+                entries.push((sl, gx, gy, None, bl));
+            }
             for dy in -2_isize..=2 {
                 for dx in -2_isize..=2 {
                     if dx == 0 && dy == 0 {
@@ -1008,6 +1034,67 @@ fn compute_terminal_entries(
                         entries.push((sl, nxu, nyu, None, bl));
                     }
                 }
+            }
+            // Probe along inward boundary normal so edge-adjacent pads can escape into the legal interior.
+            if let Some(pid) = pad_opt
+                && board.boundary.len() >= 3
+                && !grid.wire_allowed(sl, c2, net_id)
+                && crate::geometry::point_in_polygon(exact, &board.boundary)
+                && let Some(edge_pt) =
+                    crate::geometry::closest_point_on_polygon_edge(exact, &board.boundary)
+            {
+                let dx = exact.x - edge_pt.x;
+                let dy = exact.y - edge_pt.y;
+                let d_edge = dx.hypot(dy);
+                if d_edge > 1e-6 {
+                    let (nx, ny) = (dx / d_edge, dy / d_edge);
+                    let c45 = std::f64::consts::FRAC_1_SQRT_2;
+                    let dirs = [
+                        (nx, ny),
+                        ((nx - ny) * c45, (nx + ny) * c45),
+                        ((nx + ny) * c45, (-nx + ny) * c45),
+                    ];
+                    let edge_margin = board
+                        .edge_clearance_um
+                        .unwrap_or_else(|| board.nets[net_id].rules.clearance.max(265.0))
+                        + grid.max_half_w.max(width * 0.5);
+                    let max_probe = ((edge_margin - d_edge).max(0.0) * 1.5)
+                        + board.pads[pid].max_radius
+                        + grid.step * 4.0;
+                    let max_steps = (max_probe / grid.step).ceil().max(1.0) as usize;
+                    for (ux, uy) in dirs {
+                        let mut found = 0usize;
+                        for step_i in 1..=max_steps {
+                            let dist = step_i as f64 * grid.step;
+                            let probe = Point::new(exact.x + ux * dist, exact.y + uy * dist);
+                            let (px, py) = grid.snap(probe);
+                            let pc2 = py * grid.cols + px;
+                            if grid.wire_allowed(sl, pc2, net_id)
+                                && board.check_segment_static_with_buf(
+                                    net_id,
+                                    bl,
+                                    exact,
+                                    grid.pt_of(px, py),
+                                    width,
+                                    0.0,
+                                    sbuf,
+                                )
+                            {
+                                let entry = (sl, px, py, None, bl);
+                                if !entries[layer_start..].contains(&entry) {
+                                    entries.push(entry);
+                                }
+                                found += 1;
+                                if found >= 2 {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if entries.len() == layer_start {
+                entries.push((sl, gx, gy, None, bl));
             }
         }
     }
