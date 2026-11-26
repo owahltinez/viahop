@@ -10,16 +10,24 @@ pub mod ffi;
 pub mod geometry;
 pub mod grid;
 pub mod optimize;
+pub mod preflight;
 pub mod report;
 pub mod router;
 pub mod ses;
 pub mod sexp;
 pub mod signal;
 
-pub use board::{Board, BoardOptions, FixedPlane, NetRoute, RoutedSegment, RoutedVia};
+pub use board::{
+    Board, BoardOptions, FixedPlane, NetRoute, RoutedSegment, RoutedVia, StaticBlocker,
+};
 pub use connectivity::RouteScore;
 pub use drc::{DrcReport, DrcViolation, check_drc};
 pub use dsn::DsnDesign;
+pub use fanout::{BgaCluster, FanoutPlan, PadFanout, analyze_fanout};
+pub use preflight::{
+    BgaClusterSummary, BlockedNetPair, FixedViolation, PreflightReport, SealedPadInfo,
+    run_preflight, run_preflight_with_options,
+};
 pub use report::{RouteReport, UnroutedConnection, UnroutedKind, ViolationDetail};
 pub use router::{RouteStats, RouterConfig, route_board, route_board_with_checkpoint};
 pub use ses::parse_ses;

@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::astar::{PassParams, SearchScratch, astar_connect, unpack_node};
+use crate::astar::{Anchor, PassParams, SearchScratch, astar_connect, unpack_node};
 use crate::board::{Board, NetRoute, Pad, RoutedSegment, RoutedVia};
 use crate::connectivity::{
     RouteScore, count_all_unconnected, count_unconnected_pairs, score_routes,
@@ -92,8 +92,7 @@ pub(crate) struct Terminal {
     pub(crate) exact: Point,
     pub(crate) pad_id: Option<usize>,
     pub(crate) layers: Vec<usize>,
-    /// `(sig_layer, gx, gy, optional_via_pos, pad_layer_for_stub)`.
-    pub(crate) entries: Vec<(usize, usize, usize, Option<Point>, usize)>,
+    pub(crate) anchors: Vec<Anchor>,
 }
 
 struct StartOutcome {
@@ -691,8 +690,8 @@ fn route_single_net(
             continue;
         }
 
-        let src_entries = collect_comp_anchors(components, &uf, ra, n2d, grid.cols);
-        let dst_entries = collect_comp_anchors(components, &uf, rb, n2d, grid.cols);
+        let src_entries = collect_comp_anchors(components, &uf, ra);
+        let dst_entries = collect_comp_anchors(components, &uf, rb);
         let src_extra = &comp_nodes[ra];
         let dst_extra = &comp_nodes[rb];
 
@@ -968,14 +967,14 @@ pub(crate) fn build_net_components(
         if i >= pad_count && !comp_map.contains_key(&root) {
             continue;
         }
-        let entries = compute_terminal_entries(
+        let anchors = compute_terminal_entries(
             board, grid, fanout, net_id, *pt, layers, *pad_opt, &mut sbuf,
         );
         comp_map.entry(root).or_default().push(Terminal {
             exact: *pt,
             pad_id: *pad_opt,
             layers: layers.clone(),
-            entries,
+            anchors,
         });
     }
 
@@ -992,11 +991,14 @@ fn compute_terminal_entries(
     layers: &[usize],
     pad_opt: Option<usize>,
     sbuf: &mut Vec<usize>,
-) -> Vec<(usize, usize, usize, Option<Point>, usize)> {
-    let mut entries = Vec::new();
+) -> Vec<Anchor> {
+    let mut anchors = Vec::new();
+    let n2d = grid.n2d();
+    let cols = grid.cols;
     let (gx, gy) = grid.snap(exact);
-    let c2 = gy * grid.cols + gx;
-    let width = board.nets[net_id].rules.width;
+    let c2 = gy * cols + gx;
+    let rules = &board.nets[net_id].rules;
+    let width = rules.width;
 
     let mut primary_pad_layer = None;
     for &bl in layers {
@@ -1004,9 +1006,15 @@ fn compute_terminal_entries(
             if primary_pad_layer.is_none() {
                 primary_pad_layer = Some(bl);
             }
-            let layer_start = entries.len();
+            let layer_start = anchors.len();
             if grid.wire_allowed(sl, c2, net_id) {
-                entries.push((sl, gx, gy, None, bl));
+                anchors.push(Anchor {
+                    node: (sl * n2d + c2) as u32,
+                    exact,
+                    via_pos: None,
+                    pad_layer: bl,
+                    bias: 0.0,
+                });
             }
             for dy in -2_isize..=2 {
                 for dx in -2_isize..=2 {
@@ -1015,11 +1023,11 @@ fn compute_terminal_entries(
                     }
                     let nx = gx as isize + dx;
                     let ny = gy as isize + dy;
-                    if nx < 0 || ny < 0 || nx >= grid.cols as isize || ny >= grid.rows as isize {
+                    if nx < 0 || ny < 0 || nx >= cols as isize || ny >= grid.rows as isize {
                         continue;
                     }
                     let (nxu, nyu) = (nx as usize, ny as usize);
-                    let nc2 = nyu * grid.cols + nxu;
+                    let nc2 = nyu * cols + nxu;
                     if grid.wire_allowed(sl, nc2, net_id)
                         && board.check_segment_static_with_buf(
                             net_id,
@@ -1031,7 +1039,13 @@ fn compute_terminal_entries(
                             sbuf,
                         )
                     {
-                        entries.push((sl, nxu, nyu, None, bl));
+                        anchors.push(Anchor {
+                            node: (sl * n2d + nc2) as u32,
+                            exact,
+                            via_pos: None,
+                            pad_layer: bl,
+                            bias: 0.0,
+                        });
                     }
                 }
             }
@@ -1068,7 +1082,7 @@ fn compute_terminal_entries(
                             let dist = step_i as f64 * grid.step;
                             let probe = Point::new(exact.x + ux * dist, exact.y + uy * dist);
                             let (px, py) = grid.snap(probe);
-                            let pc2 = py * grid.cols + px;
+                            let pc2 = py * cols + px;
                             if grid.wire_allowed(sl, pc2, net_id)
                                 && board.check_segment_static_with_buf(
                                     net_id,
@@ -1080,9 +1094,15 @@ fn compute_terminal_entries(
                                     sbuf,
                                 )
                             {
-                                let entry = (sl, px, py, None, bl);
-                                if !entries[layer_start..].contains(&entry) {
-                                    entries.push(entry);
+                                let node = (sl * n2d + pc2) as u32;
+                                if !anchors[layer_start..].iter().any(|a| a.node == node) {
+                                    anchors.push(Anchor {
+                                        node,
+                                        exact,
+                                        via_pos: None,
+                                        pad_layer: bl,
+                                        bias: 0.0,
+                                    });
                                 }
                                 found += 1;
                                 if found >= 2 {
@@ -1093,34 +1113,57 @@ fn compute_terminal_entries(
                     }
                 }
             }
-            if entries.len() == layer_start {
-                entries.push((sl, gx, gy, None, bl));
+            if anchors.len() == layer_start {
+                anchors.push(Anchor {
+                    node: (sl * n2d + c2) as u32,
+                    exact,
+                    via_pos: None,
+                    pad_layer: bl,
+                    bias: 0.0,
+                });
             }
         }
     }
 
     if let Some(pid) = pad_opt {
         let pf = &fanout.pads[pid];
-        if pf.pofv_allowed {
+        let via_target = if pf.pofv_allowed {
+            Some((c2, exact))
+        } else {
+            pf.dogbone_via.map(|db_pos| {
+                let (dgx, dgy) = grid.snap(db_pos);
+                (dgy * cols + dgx, db_pos)
+            })
+        };
+        if let Some((vc2, vpos)) = via_target {
             let pad_bl = primary_pad_layer.unwrap_or(0);
-            for (sl, &bl) in grid.sig_layers.iter().enumerate() {
-                if bl != pad_bl && grid.wire_allowed(sl, c2, net_id) {
-                    entries.push((sl, gx, gy, Some(exact), pad_bl));
-                }
-            }
-        } else if let Some(db_pos) = pf.dogbone_via {
-            let (dgx, dgy) = grid.snap(db_pos);
-            let dc2 = dgy * grid.cols + dgx;
-            let pad_bl = primary_pad_layer.unwrap_or(0);
-            for (sl, &bl) in grid.sig_layers.iter().enumerate() {
-                if bl != pad_bl && grid.wire_allowed(sl, dc2, net_id) {
-                    entries.push((sl, dgx, dgy, Some(db_pos), pad_bl));
+            if rules.via_layers.contains(&pad_bl) {
+                for (sl, &bl) in grid.sig_layers.iter().enumerate() {
+                    if bl != pad_bl
+                        && rules.via_layers.contains(&bl)
+                        && grid.wire_allowed(sl, vc2, net_id)
+                    {
+                        // Gently prioritize ring-0 surface escape and ring-balanced inner layers.
+                        let bias = match (pf.bga_ring, pf.preferred_escape_layer) {
+                            (Some(0), Some(pref)) if pref == pad_bl => 3.5,
+                            (_, Some(pref)) if pref == bl => -1.0,
+                            (_, Some(_)) => 2.0,
+                            _ => 0.0,
+                        };
+                        anchors.push(Anchor {
+                            node: (sl * n2d + vc2) as u32,
+                            exact,
+                            via_pos: Some(vpos),
+                            pad_layer: pad_bl,
+                            bias,
+                        });
+                    }
                 }
             }
         }
     }
 
-    entries
+    anchors
 }
 
 pub(crate) fn build_mst(components: &[Vec<Terminal>]) -> Vec<(usize, usize)> {
@@ -1168,25 +1211,16 @@ pub(crate) fn build_mst(components: &[Vec<Terminal>]) -> Vec<(usize, usize)> {
     edges
 }
 
-fn collect_comp_anchors(
-    components: &[Vec<Terminal>],
-    uf: &[usize],
-    root: usize,
-    n2d: usize,
-    cols: usize,
-) -> Vec<(u32, Point, Option<Point>, usize)> {
+fn collect_comp_anchors(components: &[Vec<Terminal>], uf: &[usize], root: usize) -> Vec<Anchor> {
     let mut out = Vec::new();
     for (ci, comp) in components.iter().enumerate() {
         let mut r = ci;
         while uf[r] != r {
             r = uf[r];
         }
-        if r != root {
-            continue;
-        }
-        for t in comp {
-            for &(sl, gx, gy, via_opt, pad_bl) in &t.entries {
-                out.push(((sl * n2d + gy * cols + gx) as u32, t.exact, via_opt, pad_bl));
+        if r == root {
+            for t in comp {
+                out.extend_from_slice(&t.anchors);
             }
         }
     }
@@ -1274,14 +1308,11 @@ fn pad_touches_point(pad: &Pad, pt: Point, layers: &[usize], radius: f64) -> boo
     })
 }
 
-fn match_anchor(
-    anchors: &[(u32, Point, Option<Point>, usize)],
-    node: u32,
-) -> Option<(Point, Option<Point>, usize)> {
+fn match_anchor(anchors: &[Anchor], node: u32) -> Option<(Point, Option<Point>, usize)> {
     anchors
         .iter()
-        .find(|&&(n, _, _, _)| n == node)
-        .map(|&(_, pt, via_opt, bl)| (pt, via_opt, bl))
+        .find(|a| a.node == node)
+        .map(|a| (a.exact, a.via_pos, a.pad_layer))
 }
 
 fn push_unique_via(
@@ -1373,6 +1404,79 @@ fn log_unconnected_debug(
             routes[nid].unconnected_pairs,
             net_components[nid].len(),
             pads_info,
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dsn::DsnDesign;
+
+    #[test]
+    fn terminal_entries_filter_via_layers() {
+        let dsn = r#"(pcb blind_entries.dsn
+  (parser (string_quote ") (host_cad "KiCad's Pcbnew") (host_version "10.0.1"))
+  (resolution um 10)
+  (unit um)
+  (structure
+    (layer F.Cu (type signal) (property (index 0)))
+    (layer In1.Cu (type power) (property (index 1)))
+    (layer In2.Cu (type signal) (property (index 2)))
+    (layer In3.Cu (type power) (property (index 3)))
+    (layer In4.Cu (type signal) (property (index 4)))
+    (layer B.Cu (type signal) (property (index 5)))
+    (boundary (rect pcb 0 0 10000 10000))
+    (via "Via[0-2]_150:75_um")
+    (rule (width 80) (clearance 80))
+    (control (via_at_smd on))
+  )
+  (placement
+    (component P1
+      (place U1 3000 5000 front 0)
+      (place U2 7000 5000 front 0)
+    )
+  )
+  (library
+    (image P1 (pin SMD_220 1 0 0))
+    (padstack SMD_220 (shape (circle F.Cu 220)) (attach off))
+    (padstack "Via[0-2]_150:75_um"
+      (shape (circle F.Cu 150))
+      (shape (circle In1.Cu 150))
+      (shape (circle In2.Cu 150))
+      (attach off)
+    )
+  )
+  (network
+    (net /SIG (pins U1-1 U2-1))
+    (class default /SIG
+      (circuit (use_via "Via[0-2]_150:75_um"))
+      (rule (width 80) (clearance 80))
+    )
+  )
+  (wiring)
+)"#;
+        let design = DsnDesign::parse(dsn).unwrap();
+        let board = Board::from_dsn(&design, &HashSet::new(), Some(true)).unwrap();
+        let fanout = analyze_fanout(&board);
+        let grid = RoutingGrid::build(&board, &fanout, 1);
+        let nid = board.net_name_to_id["/SIG"];
+        let comps = build_net_components(&board, &grid, &fanout, nid);
+        let n2d = grid.n2d();
+        let via_layers: Vec<usize> = comps
+            .iter()
+            .flatten()
+            .flat_map(|t| t.anchors.iter())
+            .filter(|a| a.via_pos.is_some())
+            .map(|a| {
+                let (sl, _, _) = unpack_node(a.node, n2d, grid.cols);
+                grid.sig_layers[sl]
+            })
+            .collect();
+        assert!(!via_layers.is_empty(), "expected blind POFV via anchors");
+        assert!(
+            via_layers.iter().all(|&bl| bl == 2),
+            "blind via [0-2] must only emit via anchors on In2.Cu (2), got {via_layers:?}"
         );
     }
 }

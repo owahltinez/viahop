@@ -4,14 +4,15 @@ Fast, standalone, zero-dependency, MIT-licensed headless Specctra DSN/SES multi-
 
 ## Features
 
-- **Freerouting-compatible CLI + modern flags**: drop-in headless invocation (`-de`, `-do`, `-mp`, `-inc`, `-mt`, `-dr`, `-dl`, `--via-at-smd`, `--timeout`/`--max-time`, `--json-summary`) plus `--multi-start`, `--initial-session`, `--report`, and `--diagnose`.
+- **Freerouting-compatible CLI + modern flags**: drop-in headless invocation (`-de`, `-do`, `-mp`, `-inc`, `-mt`, `-dr`, `-dl`, `--via-at-smd`, `--timeout`/`--max-time`, `--json-summary`) plus `--preflight`, `--multi-start`, `--initial-session`, `--report`, and `--diagnose`.
 - **Rust library + C-ABI (`rlib` + `cdylib`)**: direct in-process integration from Rust, C/C++, Python `ctypes`, or KiCad plugins (`include/viahop.h`).
+- **Fast static preflight (`--preflight`)**: sub-second static feasibility check detecting sealed BGA balls, statically blocked net pairs, and pre-existing fixed-copper DRC violations with exact obstacle attribution (`exit 0` if clean, `1` if blocked).
 - **Parallel multi-start + bad-pass undo**: start 0 runs canonical ordering with zero overhead when clean; if unrouted pairs or DRC issues remain, shuffled seeds run in parallel and keep the best board while undoing degrading passes.
 - **Atomic checkpointing & graceful stop**: `-do` is updated atomically whenever a better solution is found; `Ctrl+C` (`SIGINT`/`SIGTERM`) or `--max-time` stops cleanly and keeps the best routed `.ses` on disk (a second signal exits immediately).
 - **Initial-session resume (`--initial-session`)**: load an existing `.ses` checkpoint, preserve clean routed nets, finish remaining connections, and run post-route optimization.
-- **Structured JSON reports & diagnosis (`--report`, `--diagnose`)**: report every unrouted pair and DRC violation, and test-route each unrouted pair alone on an empty grid to classify `congestion` vs static `blocked` geometry/rules.
+- **Structured JSON reports & diagnosis (`--report`, `--diagnose`)**: report every unrouted pair and DRC violation (with exact static blocker attribution), and test-route each unrouted pair alone on an empty grid to classify `congestion` vs static `blocked` geometry/rules.
 - **Pull-tight, POFV snapping & clean SES hygiene**: spatially indexed multi-segment octilinear shortcutting, inter-via layer flattening (via-pair elimination), collinear merging, centered POFV via snapping, T-junction/via-tap segment splitting, dead single-layer via pruning, and dangling stub pruning gated by zero-slack continuous DRC.
-- **Full KiCad 10 Specctra DSN/SES + DRC parity**: handles `um`/`mil`/`mm` resolutions, signal vs power layers, signal-layer `(plane ...)` polygon obstacles, board boundary polygons with configurable `--edge-clearance`, configurable drill `--hole-to-hole` clearance, structure and image keepouts, front/back placement mirroring and rotation, fixed wires/vias, per-class clearances, and centered POFV via-in-pad fanout for dense `0.40 mm` / `0.50 mm` BGAs.
+- **Full KiCad 10 Specctra DSN/SES, DRC parity & coordinated BGA escape**: handles `um`/`mil`/`mm` resolutions, signal vs power layers, signal-layer `(plane ...)` polygon obstacles, board boundary polygons with configurable `--edge-clearance`, configurable drill `--hole-to-hole` clearance, structure and image keepouts, front/back placement mirroring and rotation, fixed wires/vias, per-class clearances, concentric BGA ring-depth escape planning, non-colliding dogbone vias, and centered POFV via-in-pad fanout for dense `0.40 mm` / `0.50 mm` BGAs.
 
 ## Install & Build
 
@@ -40,13 +41,17 @@ viahop -i board.dsn -o board.ses --max-passes 25 --ignore GND,AGND --via-at-smd 
 # Parallel multi-start with diagnostic report and time cap
 viahop -i board.dsn -o board.ses --threads 4 --multi-start=4 --max-time=60 --report report.json --diagnose
 
+# Fast static preflight check (no output file required; exits 0 if feasible, 1 if blocked)
+viahop -i board.dsn --rules board.rules --ignore GND,AGND --via-at-smd --threads 4 --preflight --json-summary
+
 # Resume and optimize from an existing session checkpoint
 viahop -i board.dsn -o board_opt.ses --initial-session board.ses --max-passes 10
 ```
 
 Flags:
 - `-i`, `--input <FILE>` (alias: `-de`): input Specctra DSN
-- `-o`, `--output <FILE>` (alias: `-do`): output Specctra SES (atomically checkpointed on improvement)
+- `-o`, `--output <FILE>` (alias: `-do`): output Specctra SES (optional with `--preflight`; atomically checkpointed on improvement)
+- `--preflight`: run fast static feasibility, sealed-BGA, and fixed-copper check without routing (exits `0` if ok, `1` otherwise)
 - `--max-passes <N>` (alias: `-mp`): max rip-up-and-reroute passes per start (default `20`)
 - `--multi-start <N>`: parallel shuffled starts if unrouted pairs or DRC issues remain (default `4`)
 - `--initial-session <FILE>`: resume routing/optimization from an existing `.ses` file

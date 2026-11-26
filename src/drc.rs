@@ -17,6 +17,7 @@ pub struct DrcViolation {
     pub kind: &'static str,
     pub gap_um: f64,
     pub required_um: f64,
+    pub blocker: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -59,7 +60,7 @@ pub fn check_drc(board: &Board, routes: &[NetRoute]) -> DrcReport {
     // 1. Check routed segments against static obstacles & other routed segments.
     for (idx, &(net_a, seg, bb)) in all_segs.iter().enumerate() {
         let half_w = seg.width * 0.5;
-        if !board.check_segment_static_with_buf(
+        if let Some(diag) = board.diagnose_segment_static_with_buf(
             net_a,
             seg.layer,
             seg.a,
@@ -71,12 +72,13 @@ pub fn check_drc(board: &Board, routes: &[NetRoute]) -> DrcReport {
             report.conflicting_nets.insert(net_a);
             report.violations.push(DrcViolation {
                 net_a,
-                net_b: None,
+                net_b: diag.net_b,
                 layer: Some(seg.layer),
                 pos: Point::new((seg.a.x + seg.b.x) * 0.5, (seg.a.y + seg.b.y) * 0.5),
                 kind: "seg_static",
-                gap_um: 0.0,
-                required_um: board.nets[net_a].rules.clearance,
+                gap_um: diag.gap_um,
+                required_um: diag.required_um,
+                blocker: Some(diag.label),
             });
         }
 
@@ -104,6 +106,7 @@ pub fn check_drc(board: &Board, routes: &[NetRoute]) -> DrcReport {
                     kind: "seg_seg",
                     gap_um: gap,
                     required_um: req,
+                    blocker: None,
                 });
             }
         }
@@ -111,7 +114,7 @@ pub fn check_drc(board: &Board, routes: &[NetRoute]) -> DrcReport {
 
     // 2. Check routed vias against static obstacles, other routed vias, and other routed segments.
     for (idx, &(net_a, via, bb)) in all_vias.iter().enumerate() {
-        if !board.check_routed_via_static_with_buf(
+        if let Some(diag) = board.diagnose_routed_via_static_with_buf(
             net_a,
             via.pos,
             via.radius,
@@ -123,12 +126,13 @@ pub fn check_drc(board: &Board, routes: &[NetRoute]) -> DrcReport {
             report.conflicting_nets.insert(net_a);
             report.violations.push(DrcViolation {
                 net_a,
-                net_b: None,
+                net_b: diag.net_b,
                 layer: None,
                 pos: via.pos,
                 kind: "via_static",
-                gap_um: 0.0,
-                required_um: board.nets[net_a].rules.via_smd,
+                gap_um: diag.gap_um,
+                required_um: diag.required_um,
+                blocker: Some(diag.label),
             });
         }
 
@@ -156,6 +160,7 @@ pub fn check_drc(board: &Board, routes: &[NetRoute]) -> DrcReport {
                         kind: "via_hole_same_net",
                         gap_um: hole_gap,
                         required_um: board.hole_to_hole_um,
+                        blocker: None,
                     });
                 }
                 continue;
@@ -180,6 +185,7 @@ pub fn check_drc(board: &Board, routes: &[NetRoute]) -> DrcReport {
                     kind: "via_via",
                     gap_um,
                     required_um,
+                    blocker: None,
                 });
             }
         }
@@ -207,6 +213,7 @@ pub fn check_drc(board: &Board, routes: &[NetRoute]) -> DrcReport {
                     kind: "via_seg",
                     gap_um: gap,
                     required_um: req,
+                    blocker: None,
                 });
             }
         }

@@ -2,7 +2,7 @@
 
 use std::fmt::Write;
 
-use crate::astar::{PassParams, SearchScratch, astar_connect};
+use crate::astar::{Anchor, PassParams, SearchScratch, astar_connect};
 use crate::board::{Board, NetRoute};
 use crate::connectivity::connected_component_clusters;
 use crate::drc::check_drc;
@@ -41,6 +41,7 @@ pub struct ViolationDetail {
     pub pos: Point,
     pub gap_um: f64,
     pub required_um: f64,
+    pub blocker: Option<String>,
 }
 
 /// Complete machine-readable routing report for `--report` / `--diagnose`.
@@ -68,6 +69,7 @@ impl RouteReport {
                 pos: v.pos,
                 gap_um: v.gap_um,
                 required_um: v.required_um,
+                blocker: v.blocker.clone(),
             })
             .collect();
 
@@ -128,9 +130,13 @@ impl RouteReport {
                 .layer
                 .as_deref()
                 .map_or_else(|| "null".to_string(), json_str);
+            let blocker = v
+                .blocker
+                .as_deref()
+                .map_or_else(|| "null".to_string(), json_str);
             let _ = writeln!(
                 out,
-                "    {{\"kind\":{},\"net_a\":{},\"net_b\":{},\"layer\":{},\"pos_um\":[{:.1},{:.1}],\"gap_um\":{:.2},\"required_um\":{:.2}}}{comma}",
+                "    {{\"kind\":{},\"net_a\":{},\"net_b\":{},\"layer\":{},\"pos_um\":[{:.1},{:.1}],\"gap_um\":{:.2},\"required_um\":{:.2},\"blocker\":{}}}{comma}",
                 json_str(&v.kind),
                 json_str(&v.net_a),
                 net_b,
@@ -139,6 +145,7 @@ impl RouteReport {
                 v.pos.y,
                 v.gap_um,
                 v.required_um,
+                blocker,
             );
         }
         let _ = writeln!(out, "  ]");
@@ -184,48 +191,23 @@ fn diagnose_unrouted_pairs(
             })
             .collect();
         let mst_edges = build_mst(&cluster_terms);
-        let min_via_dist = board.min_via_spacing(net.id);
 
         for (ca, cb) in mst_edges {
             let (ta, tb) = closest_terminals(&cluster_terms[ca], &cluster_terms[cb]);
             let (diagnosis, reason) = if diagnose {
-                let src = cluster_anchors(&cluster_terms[ca], n2d, grid.cols);
-                let dst = cluster_anchors(&cluster_terms[cb], n2d, grid.cols);
-                if src.is_empty() || dst.is_empty() {
-                    (
-                        Some(UnroutedKind::Blocked),
-                        Some("no_legal_terminal_entry".to_string()),
-                    )
-                } else {
-                    let params = PassParams {
-                        present_factor: 1.0,
-                        h_weight: 1.15,
-                        strict_mode: true,
-                        max_expansions: 1_200_000,
-                    };
-                    let solo = astar_connect(
-                        &grid,
-                        net.id,
-                        &src,
-                        &[],
-                        &dst,
-                        &[],
-                        &[],
-                        min_via_dist,
-                        &params,
-                        &mut scratch,
-                    );
-                    if solo.is_some() {
-                        (
-                            Some(UnroutedKind::Congestion),
-                            Some("routable_alone_blocked_by_other_nets".to_string()),
-                        )
-                    } else {
-                        (
-                            Some(UnroutedKind::Blocked),
-                            Some("static_obstacle_or_rule_blockage".to_string()),
-                        )
-                    }
+                match solo_pair_block_reason(
+                    board,
+                    &grid,
+                    net.id,
+                    &cluster_terms[ca],
+                    &cluster_terms[cb],
+                    &mut scratch,
+                ) {
+                    None => (
+                        Some(UnroutedKind::Congestion),
+                        Some("routable_alone_blocked_by_other_nets".to_string()),
+                    ),
+                    Some(r) => (Some(UnroutedKind::Blocked), Some(r.to_string())),
                 }
             } else {
                 (None, None)
@@ -247,21 +229,58 @@ fn diagnose_unrouted_pairs(
     out
 }
 
-fn cluster_anchors(
-    terms: &[Terminal],
-    n2d: usize,
-    cols: usize,
-) -> Vec<(u32, Point, Option<Point>, usize)> {
-    let mut out = Vec::new();
-    for t in terms {
-        for &(sl, gx, gy, via_opt, pad_bl) in &t.entries {
-            out.push(((sl * n2d + gy * cols + gx) as u32, t.exact, via_opt, pad_bl));
-        }
+/// Checks whether two terminal clusters can connect alone on an empty grid.
+pub(crate) fn solo_pair_block_reason(
+    board: &Board,
+    grid: &RoutingGrid,
+    net_id: usize,
+    src_terms: &[Terminal],
+    dst_terms: &[Terminal],
+    scratch: &mut SearchScratch,
+) -> Option<&'static str> {
+    let src = cluster_anchors(src_terms);
+    let dst = cluster_anchors(dst_terms);
+    if src.is_empty() || dst.is_empty() {
+        return Some("no_legal_terminal_entry");
     }
-    out
+    let params = PassParams {
+        present_factor: 1.0,
+        h_weight: 1.15,
+        strict_mode: true,
+        max_expansions: 1_200_000,
+    };
+    let min_via_dist = board.min_via_spacing(net_id);
+    if astar_connect(
+        grid,
+        net_id,
+        &src,
+        &[],
+        &dst,
+        &[],
+        &[],
+        min_via_dist,
+        &params,
+        scratch,
+    )
+    .is_some()
+    {
+        None
+    } else {
+        Some("static_obstacle_or_rule_blockage")
+    }
 }
 
-fn closest_terminals<'a>(a: &'a [Terminal], b: &'a [Terminal]) -> (&'a Terminal, &'a Terminal) {
+pub(crate) fn cluster_anchors(terms: &[Terminal]) -> Vec<Anchor> {
+    terms
+        .iter()
+        .flat_map(|t| t.anchors.iter().copied())
+        .collect()
+}
+
+pub(crate) fn closest_terminals<'a>(
+    a: &'a [Terminal],
+    b: &'a [Terminal],
+) -> (&'a Terminal, &'a Terminal) {
     let mut best = (&a[0], &b[0]);
     let mut best_d = f64::INFINITY;
     for ta in a {
@@ -276,7 +295,7 @@ fn closest_terminals<'a>(a: &'a [Terminal], b: &'a [Terminal]) -> (&'a Terminal,
     best
 }
 
-fn terminal_label(board: &Board, t: &Terminal) -> String {
+pub(crate) fn terminal_label(board: &Board, t: &Terminal) -> String {
     if let Some(pid) = t.pad_id {
         let p = &board.pads[pid];
         format!("{}-{}", p.refdes, p.pin_name)
