@@ -26,6 +26,10 @@ pub struct RouterConfig {
     pub ignored_nets: HashSet<String>,
     /// Override DSN `(via_at_smd on|off)` when `Some`.
     pub via_at_smd: Option<bool>,
+    /// Optional drill hole-to-hole clearance override in micrometers.
+    pub hole_to_hole_um: Option<f64>,
+    /// Optional copper-to-board-edge clearance override in micrometers.
+    pub edge_clearance_um: Option<f64>,
     pub threads: usize,
     pub timeout_secs: Option<u64>,
     pub optimize: bool,
@@ -44,6 +48,8 @@ impl Default for RouterConfig {
             max_passes: 20,
             ignored_nets: HashSet::new(),
             via_at_smd: None,
+            hole_to_hole_um: None,
+            edge_clearance_um: None,
             threads: 1,
             timeout_secs: None,
             optimize: true,
@@ -628,6 +634,15 @@ where
         best_score = pre_score;
     }
 
+    // Apply final POFV snapping, T-junction splitting, and dead-via pruning even when optimize is off.
+    crate::optimize::finalize_routes(board, &mut routes);
+    count_all_unconnected(board, net_components, &mut routes, routable_nets);
+    let (final_score, _) = score_routes(board, &routes);
+    if final_score.is_better_than(best_score) {
+        notify_best(&routes, final_score);
+    }
+    best_score = final_score;
+
     StartOutcome {
         routes,
         score: best_score,
@@ -680,7 +695,8 @@ fn route_single_net(
             continue;
         }
 
-        let min_via_dist = (2.0 * rules.via_radius + rules.via_via).max(rules.via_drill + 205.0);
+        let min_via_dist = (2.0 * rules.via_radius + rules.via_via)
+            .max(rules.via_drill + board.hole_to_hole_um + 5.0);
         let path_opt = astar_connect(
             grid,
             net_id,

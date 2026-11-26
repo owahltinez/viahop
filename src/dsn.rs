@@ -48,6 +48,8 @@ pub struct Rules {
     pub via_wire: Option<f64>,
     pub via_via: Option<f64>,
     pub via_smd: Option<f64>,
+    pub hole_to_hole: Option<f64>,
+    pub edge_clearance: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -325,6 +327,22 @@ impl DsnDesign {
                 }
             }
             "rule" => parse_rules_into(node, self.unit_to_um, &mut self.default_rules),
+            "hole_to_hole" => {
+                if let Some(v) = node.as_list().and_then(|l| l.get(1)?.as_f64())
+                    && v.is_finite()
+                    && v >= 0.0
+                {
+                    self.default_rules.hole_to_hole = Some(v * self.unit_to_um);
+                }
+            }
+            "edge_clearance" => {
+                if let Some(v) = node.as_list().and_then(|l| l.get(1)?.as_f64())
+                    && v.is_finite()
+                    && v >= 0.0
+                {
+                    self.default_rules.edge_clearance = Some(v * self.unit_to_um);
+                }
+            }
             "class" => {
                 if let Some(cls) = parse_class(node, self.unit_to_um) {
                     if let Some(existing) = self.classes.iter_mut().find(|c| c.name == cls.name) {
@@ -545,7 +563,29 @@ fn parse_rules_into(node: &SExp, scale: f64, rules: &mut Rules) {
                     Some("via_wire") | Some("wire_via") => rules.via_wire = Some(val),
                     Some("via_via") => rules.via_via = Some(val),
                     Some("via_smd") | Some("smd_via") => rules.via_smd = Some(val),
+                    Some("edge") | Some("board_edge") if val.is_finite() && val >= 0.0 => {
+                        rules.edge_clearance = Some(val);
+                    }
+                    Some("hole_to_hole") if val.is_finite() && val >= 0.0 => {
+                        rules.hole_to_hole = Some(val);
+                    }
                     _ => {}
+                }
+            }
+            Some("hole_to_hole") => {
+                if let Some(val) = clist.get(1).and_then(SExp::as_f64)
+                    && val.is_finite()
+                    && val >= 0.0
+                {
+                    rules.hole_to_hole = Some(val * scale);
+                }
+            }
+            Some("edge_clearance") => {
+                if let Some(val) = clist.get(1).and_then(SExp::as_f64)
+                    && val.is_finite()
+                    && val >= 0.0
+                {
+                    rules.edge_clearance = Some(val * scale);
                 }
             }
             _ => {}
@@ -571,6 +611,12 @@ fn merge_rules(dst: &mut Rules, src: &Rules) {
     }
     if src.via_smd.is_some() {
         dst.via_smd = src.via_smd;
+    }
+    if src.hole_to_hole.is_some() {
+        dst.hole_to_hole = src.hole_to_hole;
+    }
+    if src.edge_clearance.is_some() {
+        dst.edge_clearance = src.edge_clearance;
     }
 }
 

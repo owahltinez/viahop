@@ -332,6 +332,25 @@ pub fn point_to_polygon_edge_dist(p: Point, verts: &[Point]) -> f64 {
     min_sq.sqrt()
 }
 
+/// Minimum distance from segment `(a, b)` to the boundary edges of polygon `verts`.
+pub fn segment_to_polygon_edge_dist(a: Point, b: Point, verts: &[Point]) -> f64 {
+    let n = verts.len();
+    if n < 2 {
+        return f64::INFINITY;
+    }
+    let mut min_d = f64::INFINITY;
+    for i in 0..n {
+        let e1 = verts[i];
+        let e2 = verts[(i + 1) % n];
+        let d = segment_to_segment_dist(a, b, e1, e2);
+        if d == 0.0 {
+            return 0.0;
+        }
+        min_d = min_d.min(d);
+    }
+    min_d
+}
+
 pub fn segment_to_polygon_dist(a: Point, b: Point, verts: &[Point]) -> f64 {
     if verts.is_empty() {
         return f64::INFINITY;

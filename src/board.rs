@@ -4,9 +4,43 @@ use std::collections::{HashMap, HashSet};
 
 use crate::dsn::{DsnDesign, KeepoutKind, Rules, Side, WireType};
 use crate::geometry::{
-    BBox, Point, Shape, point_in_polygon, point_to_polygon_edge_dist, segment_to_polygon_dist,
+    BBox, Point, Shape, point_in_polygon, point_to_polygon_edge_dist, segment_to_polygon_edge_dist,
     segment_to_segment_dist, transform_point,
 };
+
+/// Optional board-level clearance overrides (units: micrometers).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BoardOptions {
+    pub hole_to_hole_um: f64,
+    pub edge_clearance_um: Option<f64>,
+}
+
+impl BoardOptions {
+    pub const DEFAULT_HOLE_TO_HOLE_UM: f64 = 200.0;
+
+    /// Resolves board options from design rules with optional explicit overrides.
+    pub fn for_design(
+        design: &DsnDesign,
+        hole_to_hole_um: Option<f64>,
+        edge_clearance_um: Option<f64>,
+    ) -> Self {
+        Self {
+            hole_to_hole_um: hole_to_hole_um
+                .or(design.default_rules.hole_to_hole)
+                .unwrap_or(Self::DEFAULT_HOLE_TO_HOLE_UM),
+            edge_clearance_um: edge_clearance_um.or(design.default_rules.edge_clearance),
+        }
+    }
+}
+
+impl Default for BoardOptions {
+    fn default() -> Self {
+        Self {
+            hole_to_hole_um: Self::DEFAULT_HOLE_TO_HOLE_UM,
+            edge_clearance_um: None,
+        }
+    }
+}
 
 /// Resolved design rules for a specific net (all dimensions in micrometers).
 #[derive(Debug, Clone)]
@@ -87,6 +121,14 @@ pub struct FixedVia {
     pub drill: f64,
     pub layers: Vec<usize>,
     pub net_id: Option<usize>,
+    pub bbox: BBox,
+}
+
+#[derive(Debug, Clone)]
+pub struct FixedPlane {
+    pub layer: usize,
+    pub net_id: Option<usize>,
+    pub shape: Shape,
     pub bbox: BBox,
 }
 
@@ -215,13 +257,19 @@ pub struct Board {
     pub keepouts: Vec<ResolvedKeepout>,
     pub fixed_segments: Vec<FixedSegment>,
     pub fixed_vias: Vec<FixedVia>,
+    pub fixed_planes: Vec<FixedPlane>,
+    pub power_planes: Vec<FixedPlane>,
     pub nets: Vec<NetInfo>,
     pub net_name_to_id: HashMap<String, usize>,
     pub via_at_smd: bool,
+    pub hole_to_hole_um: f64,
+    pub edge_clearance_um: Option<f64>,
     pub pad_index: SpatialGrid,
     pub keepout_index: SpatialGrid,
     pub fixed_seg_index: SpatialGrid,
     pub fixed_via_index: SpatialGrid,
+    pub fixed_plane_index: SpatialGrid,
+    max_net_clearance: f64,
 }
 
 impl Board {
@@ -230,6 +278,37 @@ impl Board {
         ignored: &HashSet<String>,
         force_via_at_smd: Option<bool>,
     ) -> Result<Self, String> {
+        Self::from_dsn_with_options(
+            design,
+            ignored,
+            force_via_at_smd,
+            BoardOptions::for_design(design, None, None),
+        )
+    }
+
+    pub fn from_dsn_with_options(
+        design: &DsnDesign,
+        ignored: &HashSet<String>,
+        force_via_at_smd: Option<bool>,
+        options: BoardOptions,
+    ) -> Result<Self, String> {
+        if !options.hole_to_hole_um.is_finite() || options.hole_to_hole_um < 0.0 {
+            return Err(format!(
+                "hole_to_hole_um must be a non-negative finite number, got {}",
+                options.hole_to_hole_um
+            ));
+        }
+        if let Some(ec) = options.edge_clearance_um
+            && (!ec.is_finite() || ec < 0.0)
+        {
+            return Err(format!(
+                "edge_clearance_um must be a non-negative finite number, got {ec}"
+            ));
+        }
+        let hole_to_hole_um = options.hole_to_hole_um;
+        let edge_clearance_um = options
+            .edge_clearance_um
+            .or(design.default_rules.edge_clearance);
         if design.layers.is_empty() {
             return Err("DSN contains no copper layers".to_string());
         }
@@ -453,6 +532,26 @@ impl Board {
             });
         }
 
+        // Resolve signal-layer planes as routing obstacles and inner power planes for via connectivity.
+        let mut fixed_planes = Vec::new();
+        let mut power_planes = Vec::new();
+        for pl in &design.planes {
+            let Some(&layer) = layer_name_to_idx.get(&pl.layer) else {
+                continue;
+            };
+            let resolved = FixedPlane {
+                layer,
+                net_id: net_name_to_id.get(&pl.net).copied(),
+                bbox: pl.shape.bbox(),
+                shape: pl.shape.clone(),
+            };
+            if signal_layers.contains(&layer) {
+                fixed_planes.push(resolved);
+            } else {
+                power_planes.push(resolved);
+            }
+        }
+
         // Resolve net rules and ignored sets.
         let mut nets = Vec::with_capacity(design.nets.len());
         let default_via = design
@@ -525,6 +624,21 @@ impl Board {
         for (i, v) in fixed_vias.iter().enumerate() {
             fixed_via_index.insert(i, v.bbox);
         }
+        let mut fixed_plane_index = SpatialGrid::new(bounds, cell_size);
+        for (i, pl) in fixed_planes.iter().enumerate() {
+            fixed_plane_index.insert(i, pl.bbox);
+        }
+
+        let max_net_clearance = nets
+            .iter()
+            .map(|n| {
+                n.rules
+                    .clearance
+                    .max(n.rules.via_wire)
+                    .max(n.rules.via_via)
+                    .max(n.rules.via_smd)
+            })
+            .fold(0.0_f64, f64::max);
 
         let via_at_smd = force_via_at_smd.unwrap_or(design.via_at_smd);
 
@@ -538,13 +652,19 @@ impl Board {
             keepouts,
             fixed_segments,
             fixed_vias,
+            fixed_planes,
+            power_planes,
             nets,
             net_name_to_id,
             via_at_smd,
+            hole_to_hole_um,
+            edge_clearance_um,
             pad_index,
             keepout_index,
             fixed_seg_index,
             fixed_via_index,
+            fixed_plane_index,
+            max_net_clearance,
         })
     }
 
@@ -562,7 +682,7 @@ impl Board {
         if margin <= 0.0 {
             return true;
         }
-        point_to_polygon_edge_dist(p, &self.boundary) >= margin
+        point_to_polygon_edge_dist(p, &self.boundary) >= margin - 1e-4
     }
 
     /// Checks whether a via for `net_id` at `pos` clears all static obstacles.
@@ -581,10 +701,16 @@ impl Board {
     ) -> bool {
         let rules = &self.nets[net_id].rules;
         let r = rules.via_radius;
-        if !self.is_inside_boundary(pos, r + margin_extra) {
+        let edge_clr = self.edge_clearance_um.unwrap_or(0.0);
+        if !self.is_inside_boundary(pos, r + edge_clr + margin_extra) {
             return false;
         }
-        let max_clr = rules.via_via.max(rules.via_smd).max(rules.via_wire) + margin_extra;
+        let max_clr = rules
+            .via_via
+            .max(rules.via_smd)
+            .max(rules.via_wire)
+            .max(self.max_net_clearance)
+            + margin_extra.max(0.0);
         let qbox = BBox::from_point(pos, r + max_clr + 50.0);
 
         // Keepouts (structure cutouts need extra margin for curved Edge.Cuts clearance).
@@ -626,16 +752,19 @@ impl Board {
         }
 
         // Fixed vias (check both other-net copper clearance and same-net drill hole-to-hole).
-        self.fixed_via_index.query(qbox.expand(120.0), buf);
+        let hole_qbox = qbox.union(BBox::from_point(
+            pos,
+            rules.via_drill * 0.5 + self.hole_to_hole_um + margin_extra.max(0.0) + 120.0,
+        ));
+        self.fixed_via_index.query(hole_qbox, buf);
         for &vid in buf.iter() {
             let fv = &self.fixed_vias[vid];
             let center_dist = pos.dist(fv.pos);
+            let min_hole_c2c =
+                (rules.via_drill + fv.drill) * 0.5 + self.hole_to_hole_um + margin_extra;
             if fv.net_id == Some(net_id) {
-                if center_dist >= 5.0 {
-                    let min_hole_c2c = (rules.via_drill + fv.drill) * 0.5 + 205.0 + margin_extra;
-                    if center_dist < min_hole_c2c - 1e-4 {
-                        return false;
-                    }
+                if center_dist >= 5.0 && center_dist < min_hole_c2c - 1e-4 {
+                    return false;
                 }
                 continue;
             }
@@ -643,8 +772,7 @@ impl Board {
                 continue;
             }
             let req = self.via_to_via_clearance(net_id, fv.net_id) + margin_extra;
-            let hole_c2c = (rules.via_drill + fv.drill) * 0.5 + 205.0 + margin_extra;
-            if center_dist - r - fv.radius < req - 1e-4 || center_dist < hole_c2c - 1e-4 {
+            if center_dist - r - fv.radius < req - 1e-4 || center_dist < min_hole_c2c - 1e-4 {
                 return false;
             }
         }
@@ -663,6 +791,19 @@ impl Board {
                 radius: fs.half_w,
             };
             if sh.dist_to_circle(pos, r) < req - 1e-4 {
+                return false;
+            }
+        }
+
+        // Signal-layer planes (other-net vias spanning the plane layer must clear it).
+        self.fixed_plane_index.query(qbox, buf);
+        for &pid in buf.iter() {
+            let fp = &self.fixed_planes[pid];
+            if fp.net_id == Some(net_id) || !rules.via_layers.contains(&fp.layer) {
+                continue;
+            }
+            let req = self.via_to_wire_clearance(net_id, fp.net_id) + margin_extra;
+            if fp.shape.dist_to_circle(pos, r) < req - 1e-4 {
                 return false;
             }
         }
@@ -702,15 +843,23 @@ impl Board {
             if !point_in_polygon(a, &self.boundary) || !point_in_polygon(b, &self.boundary) {
                 return false;
             }
-            if segment_to_polygon_dist(a, b, &self.boundary) < half_w + margin_extra {
-                let da = point_to_polygon_edge_dist(a, &self.boundary);
-                let db = point_to_polygon_edge_dist(b, &self.boundary);
-                if da < half_w + margin_extra || db < half_w + margin_extra {
+            let edge_clr = self.edge_clearance_um.unwrap_or(0.0);
+            let edge_req = half_w + edge_clr + margin_extra;
+            let edge_d = segment_to_polygon_edge_dist(a, b, &self.boundary);
+            if edge_d < edge_req - 1e-4 {
+                if edge_d < half_w + margin_extra - 1e-4 {
+                    return false;
+                }
+                if !self.segment_edge_pad_exit(net_id, layer, a, b, edge_d, edge_req) {
                     return false;
                 }
             }
         }
-        let max_clr = rules.clearance.max(rules.via_wire) + margin_extra;
+        let max_clr = rules
+            .clearance
+            .max(rules.via_wire)
+            .max(self.max_net_clearance)
+            + margin_extra.max(0.0);
         let qbox = BBox::from_points(&[a, b], half_w + max_clr + 50.0);
 
         // Keepouts (structure cutouts carry extra margin for curved Edge.Cuts clearance).
@@ -776,7 +925,61 @@ impl Board {
             }
         }
 
+        // Signal-layer planes (other-net segments on the same layer must clear the plane).
+        self.fixed_plane_index.query(qbox, buf);
+        for &pid in buf.iter() {
+            let fp = &self.fixed_planes[pid];
+            if fp.net_id == Some(net_id) || fp.layer != layer {
+                continue;
+            }
+            let req = self.wire_to_other_clearance(net_id, fp.net_id) + margin_extra;
+            if fp.shape.dist_to_capsule(a, b, half_w) < req - 1e-4 {
+                return false;
+            }
+        }
+
         true
+    }
+
+    // Allows short landing stubs exiting a same-net pad that itself sits closer than edge_req.
+    fn segment_edge_pad_exit(
+        &self,
+        net_id: usize,
+        layer: usize,
+        a: Point,
+        b: Point,
+        edge_d: f64,
+        edge_req: f64,
+    ) -> bool {
+        let da = point_to_polygon_edge_dist(a, &self.boundary);
+        let db = point_to_polygon_edge_dist(b, &self.boundary);
+        let seg_len = a.dist(b);
+        for &pid in &self.nets[net_id].pad_ids {
+            let pad = &self.pads[pid];
+            let Some(sh) = pad.shape_on_layer(layer) else {
+                continue;
+            };
+            let a_in = sh.dist_to_circle(a, 0.0) <= 1.0;
+            let b_in = sh.dist_to_circle(b, 0.0) <= 1.0;
+            if a_in && b_in {
+                return true;
+            }
+            if a_in
+                && da <= edge_d + 1e-3
+                && db >= edge_req - 1e-4
+                && seg_len <= pad.max_radius + 150.0
+            {
+                return true;
+            }
+            if b_in
+                && db <= edge_d + 1e-3
+                && da >= edge_req - 1e-4
+                && seg_len <= pad.max_radius + 150.0
+            {
+                return true;
+            }
+        }
+        false
     }
 
     pub fn wire_to_other_clearance(&self, net_a: usize, net_b: Option<usize>) -> f64 {

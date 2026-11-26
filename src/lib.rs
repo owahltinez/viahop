@@ -16,7 +16,7 @@ pub mod ses;
 pub mod sexp;
 pub mod signal;
 
-pub use board::{Board, NetRoute, RoutedSegment, RoutedVia};
+pub use board::{Board, BoardOptions, FixedPlane, NetRoute, RoutedSegment, RoutedVia};
 pub use connectivity::RouteScore;
 pub use drc::{DrcReport, DrcViolation, check_drc};
 pub use dsn::DsnDesign;
@@ -57,7 +57,10 @@ impl RouteStats {
 
 /// Resolves `design` into a physical board and routes all non-ignored nets.
 pub fn route(design: &DsnDesign, config: &RouterConfig) -> Result<RouteResult, String> {
-    let board = Board::from_dsn(design, &config.ignored_nets, config.via_at_smd)?;
+    let options =
+        BoardOptions::for_design(design, config.hole_to_hole_um, config.edge_clearance_um);
+    let board =
+        Board::from_dsn_with_options(design, &config.ignored_nets, config.via_at_smd, options)?;
     let inner = router::route_board(&board, config);
     Ok(RouteResult {
         board,
@@ -76,7 +79,10 @@ pub fn route_with_checkpoint<F>(
 where
     F: Fn(&Board, &[NetRoute], RouteScore) + Sync,
 {
-    let board = Board::from_dsn(design, &config.ignored_nets, config.via_at_smd)?;
+    let options =
+        BoardOptions::for_design(design, config.hole_to_hole_um, config.edge_clearance_um);
+    let board =
+        Board::from_dsn_with_options(design, &config.ignored_nets, config.via_at_smd, options)?;
     let hook = |routes: &[NetRoute], score: RouteScore| on_best(&board, routes, score);
     let inner = router::route_board_with_checkpoint(&board, config, Some(&hook));
     Ok(RouteResult {
