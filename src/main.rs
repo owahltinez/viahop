@@ -9,24 +9,27 @@ use std::process::ExitCode;
 use std::sync::Mutex;
 
 use viahop::{
-    Board, DsnDesign, RouteReport, RouteScore, RouterConfig, parse_ses,
-    route_board_with_checkpoint, ses, signal, validate_reroute_nets,
+    Board, BoardOptions, DsnDesign, RouteReport, RouteScore, RouterConfig, parse_ses,
+    route_board_with_checkpoint, run_preflight_with_options, ses, signal, validate_reroute_nets,
 };
 
 struct CliArgs {
     input_dsn: String,
-    output_ses: String,
+    output_ses: Option<String>,
     rules_file: Option<String>,
     initial_session: Option<String>,
     reroute_nets: Option<HashSet<String>>,
     reroute_pad_mm: Option<f64>,
     report_file: Option<String>,
     diagnose: bool,
+    preflight: bool,
     max_passes: usize,
     multi_start: usize,
     ignored_nets: HashSet<String>,
     threads: usize,
     via_at_smd: Option<bool>,
+    hole_to_hole_um: Option<f64>,
+    edge_clearance_um: Option<f64>,
     timeout_secs: Option<u64>,
     disable_log: bool,
     json_summary: bool,
@@ -44,7 +47,7 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Ok(Action::Run(cli)) => match run(*cli) {
-            Ok(()) => ExitCode::SUCCESS,
+            Ok(code) => code,
             Err(e) => {
                 eprintln!("error: {e}");
                 ExitCode::FAILURE
@@ -75,11 +78,14 @@ fn parse_args(args: &[String]) -> Result<Action, String> {
     let mut reroute_pad_mm: Option<f64> = None;
     let mut report_file: Option<String> = None;
     let mut diagnose = false;
+    let mut preflight = false;
     let mut max_passes: usize = 20;
     let mut multi_start: usize = 4;
     let mut ignored_nets = HashSet::new();
     let mut threads: usize = 1;
     let mut via_at_smd: Option<bool> = None;
+    let mut hole_to_hole_um: Option<f64> = None;
+    let mut edge_clearance_um: Option<f64> = None;
     let mut timeout_secs: Option<u64> = None;
     let mut disable_log = false;
     let mut json_summary = false;
@@ -134,6 +140,7 @@ fn parse_args(args: &[String]) -> Result<Action, String> {
             }
             "--report" => report_file = Some(next_val(&mut i, flag, inline_val)?),
             "--diagnose" => diagnose = true,
+            "--preflight" => preflight = true,
             "-mp" | "--max-passes" => {
                 let v = next_val(&mut i, flag, inline_val)?;
                 max_passes = v
@@ -166,6 +173,14 @@ fn parse_args(args: &[String]) -> Result<Action, String> {
             "-q" | "-dl" | "--quiet" | "--disable-log" => disable_log = true,
             "--via-at-smd" => via_at_smd = Some(true),
             "--no-via-at-smd" => via_at_smd = Some(false),
+            "--hole-to-hole" => {
+                let v = next_val(&mut i, flag, inline_val)?;
+                hole_to_hole_um = Some(parse_non_negative_f64(flag, &v)?);
+            }
+            "--edge-clearance" => {
+                let v = next_val(&mut i, flag, inline_val)?;
+                edge_clearance_um = Some(parse_non_negative_f64(flag, &v)?);
+            }
             "--timeout" | "--max-time" => {
                 let v = next_val(&mut i, flag, inline_val)?;
                 timeout_secs = Some(
@@ -180,7 +195,9 @@ fn parse_args(args: &[String]) -> Result<Action, String> {
     }
 
     let input_dsn = input_dsn.ok_or("missing required input DSN (-de <INPUT.dsn>)")?;
-    let output_ses = output_ses.ok_or("missing required output SES (-do <OUTPUT.ses>)")?;
+    if !preflight && output_ses.is_none() {
+        return Err("missing required output SES (-do <OUTPUT.ses>)".to_string());
+    }
     if reroute_pad_mm.is_some() && reroute_nets.is_none() {
         return Err("--reroute-pad-mm requires --reroute-nets".to_string());
     }
@@ -194,18 +211,33 @@ fn parse_args(args: &[String]) -> Result<Action, String> {
         reroute_pad_mm,
         report_file,
         diagnose,
+        preflight,
         max_passes,
         multi_start,
         ignored_nets,
         threads,
         via_at_smd,
+        hole_to_hole_um,
+        edge_clearance_um,
         timeout_secs,
         disable_log,
         json_summary,
     })))
 }
 
-fn run(cli: CliArgs) -> Result<(), String> {
+fn parse_non_negative_f64(flag: &str, v: &str) -> Result<f64, String> {
+    let val = v
+        .parse::<f64>()
+        .map_err(|_| format!("invalid number for {flag}: {v}"))?;
+    if !val.is_finite() || val < 0.0 {
+        return Err(format!(
+            "{flag} must be a non-negative finite number, got: {v}"
+        ));
+    }
+    Ok(val)
+}
+
+fn run(cli: CliArgs) -> Result<ExitCode, String> {
     signal::install_signal_handlers();
 
     let dsn_text = fs::read_to_string(&cli.input_dsn)
@@ -217,10 +249,52 @@ fn run(cli: CliArgs) -> Result<(), String> {
         design.apply_rules_file(&rules_text)?;
     }
 
-    let board = Board::from_dsn(&design, &cli.ignored_nets, cli.via_at_smd)?;
+    let board_opts = BoardOptions {
+        hole_to_hole_um: cli.hole_to_hole_um,
+        edge_clearance_um: cli.edge_clearance_um,
+    };
+    let board =
+        Board::from_dsn_with_options(&design, &cli.ignored_nets, cli.via_at_smd, board_opts)?;
     if let Some(ref targets) = cli.reroute_nets {
         validate_reroute_nets(&board, targets)?;
     }
+    if cli.preflight {
+        let report = run_preflight_with_options(&board, cli.threads, cli.timeout_secs, None);
+        if let Some(ref report_path) = cli.report_file {
+            write_atomic(report_path, &report.to_json())
+                .map_err(|e| format!("failed to write report {report_path}: {e}"))?;
+        }
+        if cli.json_summary {
+            println!("{}", report.to_json());
+        } else if !cli.disable_log {
+            let stopped = if report.stopped_early {
+                " [stopped]"
+            } else {
+                ""
+            };
+            eprintln!(
+                "viahop preflight: ok={} ({}/{} routable nets, {} BGA clusters, {} sealed pads, {} blocked pairs, {} fixed violations, grid={}um, {}ms){stopped}",
+                report.ok,
+                report.routable_nets,
+                report.total_nets,
+                report.bga_clusters.len(),
+                report.sealed_pads.len(),
+                report.blocked_nets.len(),
+                report.fixed_violations.len(),
+                report.grid_step_um,
+                report.elapsed_ms,
+            );
+        }
+        return Ok(if report.ok {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        });
+    }
+
+    let output_ses = cli
+        .output_ses
+        .ok_or("missing required output SES (-do <OUTPUT.ses>)")?;
     let initial_routes = if let Some(ref ses_path) = cli.initial_session {
         let ses_text = fs::read_to_string(ses_path)
             .map_err(|e| format!("failed to read initial session {ses_path}: {e}"))?;
@@ -233,6 +307,8 @@ fn run(cli: CliArgs) -> Result<(), String> {
         max_passes: cli.max_passes,
         ignored_nets: cli.ignored_nets,
         via_at_smd: cli.via_at_smd,
+        hole_to_hole_um: cli.hole_to_hole_um,
+        edge_clearance_um: cli.edge_clearance_um,
         threads: cli.threads,
         timeout_secs: cli.timeout_secs,
         optimize: true,
@@ -245,7 +321,7 @@ fn run(cli: CliArgs) -> Result<(), String> {
 
     // Atomically checkpoint `-do` whenever a strictly better routing solution is found.
     let write_lock = Mutex::new(());
-    let out_path = cli.output_ses.clone();
+    let out_path = output_ses.clone();
     let checkpoint = |routes: &[viahop::NetRoute], _score: RouteScore| {
         if let Ok(_guard) = write_lock.lock() {
             let ses_text = ses::write_ses(&design, &board, routes);
@@ -255,8 +331,8 @@ fn run(cli: CliArgs) -> Result<(), String> {
 
     let inner = route_board_with_checkpoint(&board, &config, Some(&checkpoint));
     let ses_text = ses::write_ses(&design, &board, &inner.routes);
-    write_atomic(&cli.output_ses, &ses_text)
-        .map_err(|e| format!("failed to write {}: {e}", cli.output_ses))?;
+    write_atomic(&output_ses, &ses_text)
+        .map_err(|e| format!("failed to write {output_ses}: {e}"))?;
 
     if let Some(ref report_path) = cli.report_file {
         let report = RouteReport::build(&board, &inner.routes, inner.stats.clone(), cli.diagnose);
@@ -284,7 +360,7 @@ fn run(cli: CliArgs) -> Result<(), String> {
             s.elapsed_ms,
         );
     }
-    Ok(())
+    Ok(ExitCode::SUCCESS)
 }
 
 fn write_atomic(path: &str, contents: &str) -> std::io::Result<()> {
@@ -297,10 +373,11 @@ fn write_atomic(path: &str, contents: &str) -> std::io::Result<()> {
 fn print_help() {
     println!(
         "viahop {} - Fast, standalone, zero-dependency Specctra DSN/SES PCB autorouter\n\n\
-USAGE:\n  viahop -i <INPUT.dsn> -o <OUTPUT.ses> [OPTIONS]\n\n\
+USAGE:\n  viahop -i <INPUT.dsn> -o <OUTPUT.ses> [OPTIONS]\n  viahop -i <INPUT.dsn> --preflight [OPTIONS]\n\n\
 OPTIONS:\n  \
   -i, --input <FILE>           Input Specctra DSN file (alias: -de)\n  \
-  -o, --output <FILE>          Output Specctra SES file, checkpointed on improvement (alias: -do)\n  \
+  -o, --output <FILE>          Output Specctra SES file, optional with --preflight (alias: -do)\n  \
+  --preflight                  Fast static feasibility, sealed-BGA, and fixed-copper check (exit 0/1)\n  \
   --max-passes <N>             Max rip-up-and-reroute passes per start, default 20 (alias: -mp)\n  \
   --multi-start <N>            Parallel shuffled starts if unrouted remain (default: 4)\n  \
   --initial-session <FILE>     Resume routing/optimization from an existing SES file\n  \
@@ -313,6 +390,8 @@ OPTIONS:\n  \
   --rules <FILE>               Optional Specctra rules file (alias: -dr)\n  \
   -q, --quiet                  Suppress stderr summary (alias: -dl)\n  \
   --via-at-smd / --no-via-at-smd  Override DSN POFV (via-in-pad) setting\n  \
+  --hole-to-hole <UM>          Minimum drill hole-to-hole clearance in um (default: 200)\n  \
+  --edge-clearance <UM>        Minimum copper-to-board-edge clearance in um\n  \
   --timeout, --max-time <SECS> Soft timeout in seconds (writes best board so far)\n  \
   --json-summary               Print JSON routing summary to stdout\n  \
   -h, --help                   Show this help message\n  \

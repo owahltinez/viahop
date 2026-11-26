@@ -1071,6 +1071,7 @@ fn frozen_vias_and_via_seg_drc_converge_to_zero_drc() {
             kind: "via_seg",
             gap_um: 50.0,
             required_um: 200.0,
+            blocker: None,
         }],
         conflicting_nets: HashSet::from([0]),
     };

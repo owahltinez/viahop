@@ -48,6 +48,8 @@ pub struct Rules {
     pub via_wire: Option<f64>,
     pub via_via: Option<f64>,
     pub via_smd: Option<f64>,
+    pub hole_to_hole: Option<f64>,
+    pub edge_clearance: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -215,7 +217,7 @@ impl DsnDesign {
                 }
             }
             for rule_node in structure.children_with_tag("rule") {
-                parse_rules_into(rule_node, unit_to_um, &mut default_rules);
+                parse_rules_into(rule_node, unit_to_um, &mut default_rules, true);
             }
             if let Some(ctrl) = structure.find_child("control")
                 && let Some(vas) = ctrl.find_child("via_at_smd")
@@ -324,7 +326,7 @@ impl DsnDesign {
                     }
                 }
             }
-            "rule" => parse_rules_into(node, self.unit_to_um, &mut self.default_rules),
+            "rule" => parse_rules_into(node, self.unit_to_um, &mut self.default_rules, true),
             "class" => {
                 if let Some(cls) = parse_class(node, self.unit_to_um) {
                     if let Some(existing) = self.classes.iter_mut().find(|c| c.name == cls.name) {
@@ -337,7 +339,7 @@ impl DsnDesign {
                     }
                 }
             }
-            _ => {}
+            _ => parse_rule_item(node, self.unit_to_um, &mut self.default_rules, true),
         }
     }
 }
@@ -519,37 +521,65 @@ fn parse_shape_expr(node: &SExp, scale: f64) -> Option<(String, Shape)> {
     }
 }
 
-fn parse_rules_into(node: &SExp, scale: f64, rules: &mut Rules) {
+fn parse_rule_item(item: &SExp, scale: f64, rules: &mut Rules, allow_board_rules: bool) {
+    let Some(clist) = item.as_list() else {
+        return;
+    };
+    match item.tag() {
+        Some("width") => {
+            if let Some(w) = clist.get(1).and_then(SExp::as_f64) {
+                rules.width = Some(w * scale);
+            }
+        }
+        Some("clearance") => {
+            let Some(val) = clist.get(1).and_then(SExp::as_f64) else {
+                return;
+            };
+            let val = val * scale;
+            let ctype = item
+                .find_child("type")
+                .and_then(|t| t.as_list()?.get(1)?.as_atom());
+            match ctype {
+                None => rules.clearance = Some(val),
+                Some("smd_smd") => rules.smd_smd = Some(val),
+                Some("via_wire") | Some("wire_via") => rules.via_wire = Some(val),
+                Some("via_via") => rules.via_via = Some(val),
+                Some("via_smd") | Some("smd_via") => rules.via_smd = Some(val),
+                Some("edge") | Some("board_edge")
+                    if allow_board_rules && val.is_finite() && val >= 0.0 =>
+                {
+                    rules.edge_clearance = Some(val);
+                }
+                Some("hole_to_hole") if allow_board_rules && val.is_finite() && val >= 0.0 => {
+                    rules.hole_to_hole = Some(val);
+                }
+                _ => {}
+            }
+        }
+        Some("hole_to_hole") if allow_board_rules => {
+            if let Some(val) = clist.get(1).and_then(SExp::as_f64)
+                && val.is_finite()
+                && val >= 0.0
+            {
+                rules.hole_to_hole = Some(val * scale);
+            }
+        }
+        Some("edge_clearance") if allow_board_rules => {
+            if let Some(val) = clist.get(1).and_then(SExp::as_f64)
+                && val.is_finite()
+                && val >= 0.0
+            {
+                rules.edge_clearance = Some(val * scale);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn parse_rules_into(node: &SExp, scale: f64, rules: &mut Rules, allow_board_rules: bool) {
     let Some(list) = node.as_list() else { return };
     for child in &list[1..] {
-        let Some(clist) = child.as_list() else {
-            continue;
-        };
-        match child.tag() {
-            Some("width") => {
-                if let Some(w) = clist.get(1).and_then(SExp::as_f64) {
-                    rules.width = Some(w * scale);
-                }
-            }
-            Some("clearance") => {
-                let Some(val) = clist.get(1).and_then(SExp::as_f64) else {
-                    continue;
-                };
-                let val = val * scale;
-                let ctype = child
-                    .find_child("type")
-                    .and_then(|t| t.as_list()?.get(1)?.as_atom());
-                match ctype {
-                    None => rules.clearance = Some(val),
-                    Some("smd_smd") => rules.smd_smd = Some(val),
-                    Some("via_wire") | Some("wire_via") => rules.via_wire = Some(val),
-                    Some("via_via") => rules.via_via = Some(val),
-                    Some("via_smd") | Some("smd_via") => rules.via_smd = Some(val),
-                    _ => {}
-                }
-            }
-            _ => {}
-        }
+        parse_rule_item(child, scale, rules, allow_board_rules);
     }
 }
 
@@ -716,7 +746,7 @@ fn parse_class(node: &SExp, scale: f64) -> Option<NetClass> {
                 }
             }
         } else if item.tag() == Some("rule") {
-            parse_rules_into(item, scale, &mut rules);
+            parse_rules_into(item, scale, &mut rules, false);
         }
     }
     Some(NetClass {
