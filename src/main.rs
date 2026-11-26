@@ -209,7 +209,10 @@ fn run(cli: CliArgs) -> Result<(), String> {
         design.apply_rules_file(&rules_text)?;
     }
 
-    let board_opts = BoardOptions::for_design(&design, cli.hole_to_hole_um, cli.edge_clearance_um);
+    let board_opts = BoardOptions {
+        hole_to_hole_um: cli.hole_to_hole_um,
+        edge_clearance_um: cli.edge_clearance_um,
+    };
     let board =
         Board::from_dsn_with_options(&design, &cli.ignored_nets, cli.via_at_smd, board_opts)?;
     let initial_routes = if let Some(ref ses_path) = cli.initial_session {

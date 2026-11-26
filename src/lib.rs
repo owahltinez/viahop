@@ -57,8 +57,10 @@ impl RouteStats {
 
 /// Resolves `design` into a physical board and routes all non-ignored nets.
 pub fn route(design: &DsnDesign, config: &RouterConfig) -> Result<RouteResult, String> {
-    let options =
-        BoardOptions::for_design(design, config.hole_to_hole_um, config.edge_clearance_um);
+    let options = BoardOptions {
+        hole_to_hole_um: config.hole_to_hole_um,
+        edge_clearance_um: config.edge_clearance_um,
+    };
     let board =
         Board::from_dsn_with_options(design, &config.ignored_nets, config.via_at_smd, options)?;
     let inner = router::route_board(&board, config);
@@ -79,8 +81,10 @@ pub fn route_with_checkpoint<F>(
 where
     F: Fn(&Board, &[NetRoute], RouteScore) + Sync,
 {
-    let options =
-        BoardOptions::for_design(design, config.hole_to_hole_um, config.edge_clearance_um);
+    let options = BoardOptions {
+        hole_to_hole_um: config.hole_to_hole_um,
+        edge_clearance_um: config.edge_clearance_um,
+    };
     let board =
         Board::from_dsn_with_options(design, &config.ignored_nets, config.via_at_smd, options)?;
     let hook = |routes: &[NetRoute], score: RouteScore| on_best(&board, routes, score);

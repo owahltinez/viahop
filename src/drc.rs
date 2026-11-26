@@ -53,17 +53,8 @@ pub fn check_drc(board: &Board, routes: &[NetRoute]) -> DrcReport {
 
     let mut buf = Vec::new();
     let mut static_buf = Vec::new();
-    let max_wire_clr = board
-        .nets
-        .iter()
-        .map(|n| n.rules.clearance)
-        .fold(0.0_f64, f64::max);
-    let max_via_clr = board
-        .nets
-        .iter()
-        .map(|n| n.rules.via_via.max(n.rules.via_wire))
-        .fold(0.0_f64, f64::max)
-        .max(board.hole_to_hole_um);
+    let max_wire_clr = board.max_net_clearance;
+    let max_via_clr = board.max_net_clearance.max(board.hole_to_hole_um);
 
     // 1. Check routed segments against static obstacles & other routed segments.
     for (idx, &(net_a, seg, bb)) in all_segs.iter().enumerate() {
@@ -120,7 +111,15 @@ pub fn check_drc(board: &Board, routes: &[NetRoute]) -> DrcReport {
 
     // 2. Check routed vias against static obstacles, other routed vias, and other routed segments.
     for (idx, &(net_a, via, bb)) in all_vias.iter().enumerate() {
-        if !board.check_via_static_with_buf(net_a, via.pos, 0.0, &mut static_buf) {
+        if !board.check_routed_via_static_with_buf(
+            net_a,
+            via.pos,
+            via.radius,
+            via.drill,
+            &via.layers,
+            0.0,
+            &mut static_buf,
+        ) {
             report.conflicting_nets.insert(net_a);
             report.violations.push(DrcViolation {
                 net_a,
@@ -147,7 +146,7 @@ pub fn check_drc(board: &Board, routes: &[NetRoute]) -> DrcReport {
             let hole_gap = dist - (via.drill + via_b.drill) * 0.5;
             let min_hole_c2c = (via.drill + via_b.drill) * 0.5 + board.hole_to_hole_um;
             if net_a == net_b {
-                if dist >= 1.0 && dist < min_hole_c2c - DRC_EPS {
+                if dist < min_hole_c2c - DRC_EPS {
                     report.conflicting_nets.insert(net_a);
                     report.violations.push(DrcViolation {
                         net_a,

@@ -7,7 +7,7 @@ use std::path::Path;
 use crate::board::{Board, NetRoute, RoutedSegment, RoutedVia};
 use crate::dsn::{DsnDesign, Side};
 use crate::geometry::{Point, Shape};
-use crate::optimize::{split_segments_at_junctions, via_is_active};
+use crate::optimize::{prune_dead_vias, split_segments_at_junctions};
 use crate::sexp::{self, SExp, format_atom};
 
 /// Serializes routed tracks and vias into a Specctra `.ses` file compatible with
@@ -80,14 +80,10 @@ pub fn write_ses(design: &DsnDesign, board: &Board, routes: &[NetRoute]) -> Stri
         .iter()
         .filter(|nr| !nr.segments.is_empty() || !nr.vias.is_empty())
         .map(|nr| {
-            let active_vias: Vec<RoutedVia> = nr
-                .vias
-                .iter()
-                .filter(|v| via_is_active(board, nr.net_id, &nr.segments, v))
-                .cloned()
-                .collect();
-            let split_segs = split_segments_at_junctions(&nr.segments, &active_vias);
-            (nr.net_id, split_segs, active_vias)
+            let mut active = nr.clone();
+            prune_dead_vias(board, &mut active);
+            let split_segs = split_segments_at_junctions(&active.segments, &active.vias);
+            (nr.net_id, split_segs, active.vias)
         })
         .filter(|(_, segs, vias)| !segs.is_empty() || !vias.is_empty())
         .collect();

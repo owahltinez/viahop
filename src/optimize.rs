@@ -19,14 +19,25 @@ struct RouteSpatialIndex {
 
 impl RouteSpatialIndex {
     fn build(board: &Board, routes: &[NetRoute]) -> Self {
-        let max_board_clr = board
+        let max_via_r = board
             .nets
             .iter()
-            .map(|n| {
-                n.rules.clearance.max(n.rules.via_wire).max(n.rules.via_via) + n.rules.via_radius
-            })
-            .fold(250.0_f64, f64::max)
-            .max(board.hole_to_hole_um + 250.0);
+            .map(|n| n.rules.via_radius)
+            .chain(
+                routes
+                    .iter()
+                    .flat_map(|nr| nr.vias.iter().map(|v| v.radius)),
+            )
+            .fold(0.0_f64, f64::max);
+        let max_via_d = board
+            .nets
+            .iter()
+            .map(|n| n.rules.via_drill)
+            .chain(routes.iter().flat_map(|nr| nr.vias.iter().map(|v| v.drill)))
+            .fold(0.0_f64, f64::max);
+        let max_board_clr = (board.max_net_clearance + max_via_r)
+            .max(board.hole_to_hole_um + max_via_d * 0.5 + 100.0)
+            .max(250.0);
         let mut idx = Self {
             segs: Vec::new(),
             vias: Vec::new(),
@@ -119,7 +130,6 @@ impl RouteSpatialIndex {
         net_id: usize,
         pos: Point,
         via: &RoutedVia,
-        margin: f64,
         buf: &mut Vec<usize>,
     ) -> bool {
         let qbox = BBox::from_point(pos, via.radius + self.max_board_clr + 50.0);
@@ -133,8 +143,8 @@ impl RouteSpatialIndex {
                 continue;
             }
             let dist = pos.dist(ov.pos);
-            let req = board.via_to_via_clearance(net_id, Some(other_net)) + margin;
-            let min_hole_c2c = (via.drill + ov.drill) * 0.5 + board.hole_to_hole_um + margin;
+            let req = board.via_to_via_clearance(net_id, Some(other_net));
+            let min_hole_c2c = (via.drill + ov.drill) * 0.5 + board.hole_to_hole_um;
             if dist - via.radius - ov.radius < req || dist < min_hole_c2c {
                 return false;
             }
@@ -148,7 +158,7 @@ impl RouteSpatialIndex {
             if other_net == net_id || !via.layers.contains(&seg.layer) {
                 continue;
             }
-            let req = board.via_to_wire_clearance(net_id, Some(other_net)) + margin;
+            let req = board.via_to_wire_clearance(net_id, Some(other_net));
             let gap = point_to_segment_dist(pos, seg.a, seg.b) - via.radius - seg.width * 0.5;
             if gap < req {
                 return false;
@@ -186,7 +196,7 @@ pub fn optimize_routes(board: &Board, routes: &mut [NetRoute]) {
                 prune_dangling_stubs(board, nr);
                 merge_collinear_segments(nr);
             }
-            remove_redundant_vias(board, nr);
+            prune_dead_vias(board, nr);
 
             let after_len = route_wirelength(nr);
             let changed = snapped
@@ -206,19 +216,19 @@ pub fn optimize_routes(board: &Board, routes: &mut [NetRoute]) {
     }
 
     for nr in routes.iter_mut() {
-        prune_dead_vias(board, nr);
-        split_t_junctions(nr);
+        nr.segments = split_segments_at_junctions(&nr.segments, &nr.vias);
     }
 }
 
-/// Applies final route hygiene: POFV via snapping (if enabled), dead-via pruning, and T-junction splitting.
+/// Applies final route hygiene: dead-via pruning, POFV via snapping, and T-junction splitting.
 pub fn finalize_routes(board: &Board, routes: &mut [NetRoute]) {
-    if board.via_at_smd {
-        snap_pofv_vias(board, routes);
-    }
     for nr in routes.iter_mut() {
         prune_dead_vias(board, nr);
-        split_t_junctions(nr);
+    }
+    snap_pofv_vias(board, routes);
+    for nr in routes.iter_mut() {
+        prune_dead_vias(board, nr);
+        nr.segments = split_segments_at_junctions(&nr.segments, &nr.vias);
     }
 }
 
@@ -264,18 +274,26 @@ fn snap_pofv_vias_for_net(
         let old_via = nr.vias[vi].clone();
         let old_pos = old_via.pos;
 
+        // Skip vias already centered on any same-net SMD pad on their layers.
+        let already_centered = smd_pads.iter().any(|&pad| {
+            old_pos.dist(pad.center) <= 1.0
+                && pad
+                    .layer_shapes
+                    .iter()
+                    .any(|&(l, _)| old_via.layers.contains(&l))
+        });
+        if already_centered {
+            vi += 1;
+            continue;
+        }
+
         let target_pad = smd_pads
             .iter()
             .filter_map(|&pad| {
-                let d = old_pos.dist(pad.center);
-                if d <= 1.0 {
-                    return None;
-                }
-                let inside_or_within = pad.layer_shapes.iter().any(|&(l, ref sh)| {
-                    old_via.layers.contains(&l)
-                        && (sh.dist_to_circle(old_pos, 0.0) <= 0.0 || d <= pad.max_radius)
+                let inside = pad.layer_shapes.iter().any(|&(l, ref sh)| {
+                    old_via.layers.contains(&l) && sh.dist_to_circle(old_pos, 0.0) <= 0.0
                 });
-                inside_or_within.then_some((d, pad))
+                inside.then(|| (old_pos.dist(pad.center), pad))
             })
             .min_by(|a, b| a.0.total_cmp(&b.0))
             .map(|(_, pad)| pad);
@@ -286,24 +304,84 @@ fn snap_pofv_vias_for_net(
         };
         let new_pos = pad.center;
 
-        let via_ok = board.check_via_static_with_buf(net_id, new_pos, 0.0, sbuf)
-            && index.clears_via(board, net_id, new_pos, &old_via, 0.0, qbuf)
+        let via_ok = board.check_routed_via_static_with_buf(
+            net_id,
+            new_pos,
+            old_via.radius,
+            old_via.drill,
+            &old_via.layers,
+            0.0,
+            sbuf,
+        ) && index.clears_via(board, net_id, new_pos, &old_via, qbuf)
             && nr.vias.iter().enumerate().all(|(j, sv)| {
                 if j == vi || !old_via.layers.iter().any(|l| sv.layers.contains(l)) {
                     return true;
                 }
                 let dist = new_pos.dist(sv.pos);
                 let min_hole_c2c = (old_via.drill + sv.drill) * 0.5 + board.hole_to_hole_um;
-                dist < 1.0 || dist >= min_hole_c2c
+                (dist < 1.0 && old_via.layers.iter().all(|l| sv.layers.contains(l)))
+                    || dist >= min_hole_c2c
+            })
+            && board.fixed_vias.iter().all(|fv| {
+                if fv.net_id != Some(net_id) {
+                    return true;
+                }
+                let min_hole_c2c = (old_via.drill + fv.drill) * 0.5 + board.hole_to_hole_um;
+                new_pos.dist(fv.pos) >= min_hole_c2c
             });
         if !via_ok {
             vi += 1;
             continue;
         }
 
-        let mut cand_segs: Vec<RoutedSegment> = Vec::with_capacity(nr.segments.len() + 2);
-        let mut modified_segs: Vec<RoutedSegment> = Vec::new();
-        for seg in &nr.segments {
+        // Preserve electrical contact with any static copper touching old_pos by copper overlap.
+        let static_contact_ok = board.fixed_segments.iter().all(|fs| {
+            if fs.net_id != Some(net_id) || !old_via.layers.contains(&fs.layer) {
+                return true;
+            }
+            let tol = old_via.radius + fs.half_w;
+            point_to_segment_dist(old_pos, fs.a, fs.b) > tol + 2.0
+                || point_to_segment_dist(new_pos, fs.a, fs.b) <= tol
+        }) && board.fixed_vias.iter().all(|fv| {
+            if fv.net_id != Some(net_id) || !old_via.layers.iter().any(|l| fv.layers.contains(l)) {
+                return true;
+            }
+            let tol = old_via.radius + fv.radius;
+            old_pos.dist(fv.pos) > tol + 2.0 || new_pos.dist(fv.pos) <= tol
+        }) && nr.vias.iter().enumerate().all(|(j, sv)| {
+            if j == vi || !old_via.layers.iter().any(|l| sv.layers.contains(l)) {
+                return true;
+            }
+            let tol = old_via.radius + sv.radius;
+            old_pos.dist(sv.pos) > tol + 2.0 || new_pos.dist(sv.pos) <= tol
+        }) && board.planes.iter().all(|fp| {
+            if fp.net_id != Some(net_id) || !old_via.layers.contains(&fp.layer) {
+                return true;
+            }
+            fp.shape.dist_to_circle(old_pos, old_via.radius) > 2.0
+                || fp.shape.dist_to_circle(new_pos, old_via.radius) <= 0.0
+        }) && board.nets[net_id].pad_ids.iter().all(|&pid| {
+            board.pads[pid].layer_shapes.iter().all(|&(l, ref sh)| {
+                !old_via.layers.contains(&l)
+                    || sh.dist_to_circle(old_pos, old_via.radius) > 2.0
+                    || sh.dist_to_circle(new_pos, old_via.radius) <= 0.0
+            })
+        });
+        if !static_contact_ok {
+            vi += 1;
+            continue;
+        }
+
+        // Split interior T-junctions first so moving old_pos never pivots a trunk off a branch.
+        let base_segs = split_segments_at_junctions(&nr.segments, &nr.vias);
+        let mut cand_segs: Vec<RoutedSegment> = Vec::with_capacity(base_segs.len() + 2);
+        let mut segs_ok = true;
+        let seg_ok = |ns: &RoutedSegment, sbuf: &mut Vec<usize>, qbuf: &mut Vec<usize>| -> bool {
+            board.check_segment_static_with_buf(net_id, ns.layer, ns.a, ns.b, ns.width, 0.0, sbuf)
+                && index.clears_segment(board, net_id, ns, 0.0, qbuf)
+        };
+
+        for seg in &base_segs {
             if !old_via.layers.contains(&seg.layer) {
                 cand_segs.push(seg.clone());
                 continue;
@@ -320,7 +398,10 @@ fn snap_pofv_vias_for_net(
                         b: nb,
                         width: seg.width,
                     };
-                    modified_segs.push(ns.clone());
+                    if !seg_ok(&ns, sbuf, qbuf) {
+                        segs_ok = false;
+                        break;
+                    }
                     cand_segs.push(ns);
                 }
             } else if point_to_segment_dist(old_pos, seg.a, seg.b) <= 0.5 {
@@ -332,30 +413,38 @@ fn snap_pofv_vias_for_net(
                             b: nb,
                             width: seg.width,
                         };
-                        modified_segs.push(ns.clone());
+                        if !seg_ok(&ns, sbuf, qbuf) {
+                            segs_ok = false;
+                            break;
+                        }
                         cand_segs.push(ns);
                     }
                 }
+                if !segs_ok {
+                    break;
+                }
             } else {
+                let tol = old_via.radius + seg.width * 0.5;
+                if point_to_segment_dist(old_pos, seg.a, seg.b) <= tol + 2.0
+                    && point_to_segment_dist(new_pos, seg.a, seg.b) > tol
+                {
+                    segs_ok = false;
+                    break;
+                }
                 cand_segs.push(seg.clone());
             }
         }
-
-        let segs_ok = modified_segs.iter().all(|s| {
-            board.check_segment_static_with_buf(net_id, s.layer, s.a, s.b, s.width, 0.0, sbuf)
-                && index.clears_segment(board, net_id, s, 0.0, qbuf)
-        });
         if !segs_ok {
             vi += 1;
             continue;
         }
 
         nr.segments = cand_segs;
-        let dup_exists = nr
-            .vias
-            .iter()
-            .enumerate()
-            .any(|(j, sv)| j != vi && sv.pos.dist(new_pos) < 1.0);
+        let dup_exists = nr.vias.iter().enumerate().any(|(j, sv)| {
+            j != vi
+                && sv.pos.dist(new_pos) < 1.0
+                && old_via.layers.iter().all(|l| sv.layers.contains(l))
+        });
         if dup_exists {
             nr.vias.remove(vi);
         } else {
@@ -377,9 +466,10 @@ pub fn split_segments_at_junctions(
         return Vec::new();
     }
     let mut pts_by_layer: HashMap<usize, Vec<Point>> = HashMap::new();
-    let mut seen_pts: HashMap<usize, HashSet<(i64, i64)>> = HashMap::new();
+    let mut seen_pts: HashSet<(usize, i64, i64)> = HashSet::new();
     let mut push_pt = |layer: usize, pt: Point| {
-        if seen_pts.entry(layer).or_default().insert(pt_key(pt)) {
+        let k = pt_key(pt);
+        if seen_pts.insert((layer, k.0, k.1)) {
             pts_by_layer.entry(layer).or_default().push(pt);
         }
     };
@@ -427,9 +517,6 @@ pub fn split_segments_at_junctions(
                 if pt.x < min_x || pt.x > max_x || pt.y < min_y || pt.y > max_y {
                     continue;
                 }
-                if pt.dist(s.a) <= 1.0 || pt.dist(s.b) <= 1.0 {
-                    continue;
-                }
                 let dx = pt.x - s.a.x;
                 let dy = pt.y - s.a.y;
                 let t = dx * ux + dy * uy;
@@ -457,11 +544,6 @@ pub fn split_segments_at_junctions(
         push_seg(s.layer, cur, s.b, s.width);
     }
     out
-}
-
-/// Splits a net's routed segments in-place at interior T-junctions and same-layer via centers.
-pub fn split_t_junctions(nr: &mut NetRoute) {
-    nr.segments = split_segments_at_junctions(&nr.segments, &nr.vias);
 }
 
 /// Computes total routed copper length of a net in micrometers.
@@ -971,79 +1053,122 @@ fn replace_segments(nr: &mut NetRoute, remove_mask: &[bool], additions: Vec<Rout
     nr.segments = kept;
 }
 
-/// Returns all copper layers electrically touching `pt` (using exact pad, wire, and plane geometry).
-fn connected_layers_at(
+/// Returns true when `via` electrically connects at least two distinct layers it spans.
+pub fn via_is_active(
     board: &Board,
     net_id: usize,
     segments: &[RoutedSegment],
-    pt: Point,
-    contact_radius: f64,
-) -> HashSet<usize> {
-    let pk = pt_key(pt);
+    other_vias: &[RoutedVia],
+    via: &RoutedVia,
+) -> bool {
+    let pk = pt_key(via.pos);
     let mut layers = HashSet::new();
     for s in segments {
-        if pt_key(s.a) == pk
-            || pt_key(s.b) == pk
-            || point_to_segment_dist(pt, s.a, s.b) <= contact_radius + s.width * 0.5 + 1.0
+        if via.layers.contains(&s.layer)
+            && (pt_key(s.a) == pk
+                || pt_key(s.b) == pk
+                || point_to_segment_dist(via.pos, s.a, s.b) <= via.radius + s.width * 0.5 + 1.0)
         {
             layers.insert(s.layer);
         }
     }
     for &pid in &board.nets[net_id].pad_ids {
         let p = &board.pads[pid];
-        if p.center.dist(pt) > p.max_radius + contact_radius + 5.0 {
+        if p.center.dist(via.pos) > p.max_radius + via.radius + 5.0 {
             continue;
         }
         for &(l, ref sh) in &p.layer_shapes {
-            if sh.dist_to_circle(pt, contact_radius) <= 2.0 {
+            if via.layers.contains(&l) && sh.dist_to_circle(via.pos, via.radius) <= 2.0 {
                 layers.insert(l);
             }
         }
     }
     for fs in &board.fixed_segments {
         if fs.net_id == Some(net_id)
+            && via.layers.contains(&fs.layer)
             && (pt_key(fs.a) == pk
                 || pt_key(fs.b) == pk
-                || point_to_segment_dist(pt, fs.a, fs.b) <= contact_radius + fs.half_w + 1.0)
+                || point_to_segment_dist(via.pos, fs.a, fs.b) <= via.radius + fs.half_w + 1.0)
         {
             layers.insert(fs.layer);
         }
     }
-    for fp in board.fixed_planes.iter().chain(&board.power_planes) {
-        if fp.net_id == Some(net_id) && fp.shape.dist_to_circle(pt, contact_radius) <= 2.0 {
+    for fp in &board.planes {
+        if fp.net_id == Some(net_id)
+            && via.layers.contains(&fp.layer)
+            && fp.shape.dist_to_circle(via.pos, via.radius) <= 2.0
+        {
             layers.insert(fp.layer);
         }
     }
-    layers
+    for fv in &board.fixed_vias {
+        if fv.net_id == Some(net_id) && via.pos.dist(fv.pos) <= via.radius + fv.radius + 1.0 {
+            for &l in &fv.layers {
+                if via.layers.contains(&l) {
+                    layers.insert(l);
+                }
+            }
+        }
+    }
+    for ov in other_vias {
+        if !std::ptr::eq(ov, via) && via.pos.dist(ov.pos) <= via.radius + ov.radius + 1.0 {
+            for &l in &ov.layers {
+                if via.layers.contains(&l) {
+                    layers.insert(l);
+                }
+            }
+        }
+    }
+    layers.len() >= 2
 }
 
-/// Returns true when `via` electrically connects at least two distinct layers it spans.
-pub fn via_is_active(
-    board: &Board,
-    net_id: usize,
-    segments: &[RoutedSegment],
-    via: &RoutedVia,
-) -> bool {
-    let layers = connected_layers_at(board, net_id, segments, via.pos, via.radius);
-    layers.iter().filter(|l| via.layers.contains(l)).count() >= 2
-}
-
-/// Lists layers (excluding `cur_layer`) that are electrically connected at `pt` for this net.
+/// Lists layers (excluding `cur_layer`) strictly anchored at vertex `pt` for this net.
 fn alt_layers_at(board: &Board, nr: &NetRoute, pt: Point, cur_layer: usize) -> Vec<usize> {
     let pk = pt_key(pt);
-    let via_opt = nr.vias.iter().find(|v| pt_key(v.pos) == pk);
-    let radius = via_opt.map_or(0.0, |v| v.radius);
-    let mut layers = connected_layers_at(board, nr.net_id, &nr.segments, pt, radius);
-    layers.remove(&cur_layer);
-    if via_opt.is_none() {
-        // Without a via at `pt`, only layers directly touching a same-net pad qualify.
-        layers.retain(|&l| {
-            board.nets[nr.net_id].pad_ids.iter().any(|&pid| {
-                board.pads[pid]
-                    .shape_on_layer(l)
-                    .is_some_and(|sh| sh.dist_to_circle(pt, 0.0) <= 2.0)
-            })
-        });
+    let has_via = nr.vias.iter().any(|v| pt_key(v.pos) == pk);
+    let mut layers = HashSet::new();
+    for &pid in &board.nets[nr.net_id].pad_ids {
+        let p = &board.pads[pid];
+        if p.center.dist(pt) > p.max_radius + 5.0 {
+            continue;
+        }
+        for &(l, ref sh) in &p.layer_shapes {
+            if l != cur_layer && sh.dist_to_circle(pt, 0.0) <= 2.0 {
+                layers.insert(l);
+            }
+        }
+    }
+    if has_via {
+        for s in &nr.segments {
+            if s.layer != cur_layer && (pt_key(s.a) == pk || pt_key(s.b) == pk) {
+                layers.insert(s.layer);
+            }
+        }
+        for fs in &board.fixed_segments {
+            if fs.net_id == Some(nr.net_id)
+                && fs.layer != cur_layer
+                && (pt_key(fs.a) == pk || pt_key(fs.b) == pk)
+            {
+                layers.insert(fs.layer);
+            }
+        }
+        for fv in &board.fixed_vias {
+            if fv.net_id == Some(nr.net_id) && pt_key(fv.pos) == pk {
+                for &l in &fv.layers {
+                    if l != cur_layer {
+                        layers.insert(l);
+                    }
+                }
+            }
+        }
+        for fp in &board.planes {
+            if fp.net_id == Some(nr.net_id)
+                && fp.layer != cur_layer
+                && fp.shape.dist_to_circle(pt, 0.0) <= 2.0
+            {
+                layers.insert(fp.layer);
+            }
+        }
     }
     layers.into_iter().collect()
 }
@@ -1052,12 +1177,18 @@ fn alt_layers_at(board: &Board, nr: &NetRoute, pt: Point, cur_layer: usize) -> V
 pub fn prune_dead_vias(board: &Board, nr: &mut NetRoute) {
     let net_id = nr.net_id;
     let segments = &nr.segments;
-    nr.vias
-        .retain(|via| via_is_active(board, net_id, segments, via));
-}
-
-fn remove_redundant_vias(board: &Board, nr: &mut NetRoute) {
-    prune_dead_vias(board, nr);
+    loop {
+        let before = nr.vias.len();
+        let snapshot = nr.vias.clone();
+        nr.vias = snapshot
+            .iter()
+            .filter(|via| via_is_active(board, net_id, segments, &snapshot, via))
+            .cloned()
+            .collect();
+        if nr.vias.len() == before {
+            break;
+        }
+    }
 }
 
 fn segment_clear(
