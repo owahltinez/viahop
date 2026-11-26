@@ -197,6 +197,19 @@ fn collect_net_anchors(board: &Board, nr: &NetRoute) -> HashSet<(usize, i64, i64
             anchors.insert((fs.layer, kb.0, kb.1));
         }
     }
+    for s in &nr.segments {
+        for pt in [s.a, s.b] {
+            let touches_pad = board.nets[nr.net_id].pad_ids.iter().any(|&pid| {
+                board.pads[pid]
+                    .shape_on_layer(s.layer)
+                    .is_some_and(|sh| sh.dist_to_circle(pt, 0.0) <= 2.0)
+            });
+            if touches_pad {
+                let k = pt_key(pt);
+                anchors.insert((s.layer, k.0, k.1));
+            }
+        }
+    }
     anchors
 }
 
@@ -310,6 +323,114 @@ struct SegmentChain {
     points: Vec<Point>,
 }
 
+/// Identifies segments whose interior is touched by a same-net pad, via, or segment.
+pub(crate) fn find_tapped_segments(board: &Board, nr: &NetRoute) -> Vec<bool> {
+    let net_id = nr.net_id;
+    let mut tapped = vec![false; nr.segments.len()];
+    if nr.segments.is_empty() {
+        return tapped;
+    }
+
+    let pads: Vec<&crate::board::Pad> = board.nets[net_id]
+        .pad_ids
+        .iter()
+        .map(|&pid| &board.pads[pid])
+        .collect();
+    let fixed_vias: Vec<&crate::board::FixedVia> = board
+        .fixed_vias
+        .iter()
+        .filter(|fv| fv.net_id == Some(net_id))
+        .collect();
+    let fixed_segs: Vec<&crate::board::FixedSegment> = board
+        .fixed_segments
+        .iter()
+        .filter(|fs| fs.net_id == Some(net_id))
+        .collect();
+
+    for (i, s) in nr.segments.iter().enumerate() {
+        let ka = pt_key(s.a);
+        let kb = pt_key(s.b);
+        let half_w = s.width * 0.5;
+
+        if pads.iter().any(|pad| {
+            pad.shape_on_layer(s.layer).is_some_and(|sh| {
+                sh.dist_to_circle(s.a, 0.0) > 2.0
+                    && sh.dist_to_circle(s.b, 0.0) > 2.0
+                    && sh.dist_to_capsule(s.a, s.b, half_w) <= 2.0
+            })
+        }) {
+            tapped[i] = true;
+            continue;
+        }
+
+        let via_taps = |pos: Point, radius: f64| -> bool {
+            let kv = pt_key(pos);
+            kv != ka && kv != kb && point_to_segment_dist(pos, s.a, s.b) <= radius + half_w + 2.0
+        };
+        if nr
+            .vias
+            .iter()
+            .any(|v| v.layers.contains(&s.layer) && via_taps(v.pos, v.radius))
+            || fixed_vias
+                .iter()
+                .any(|fv| fv.layers.contains(&s.layer) && via_taps(fv.pos, fv.radius))
+        {
+            tapped[i] = true;
+            continue;
+        }
+
+        let seg_tapped = nr.segments.iter().enumerate().any(|(j, o)| {
+            j != i && o.layer == s.layer && segment_taps_interior(s, o.a, o.b, o.width * 0.5)
+        }) || fixed_segs
+            .iter()
+            .any(|fs| fs.layer == s.layer && segment_taps_interior(s, fs.a, fs.b, fs.half_w));
+        if seg_tapped {
+            tapped[i] = true;
+        }
+    }
+    tapped
+}
+
+fn segment_taps_interior(s: &RoutedSegment, oa: Point, ob: Point, o_half_w: f64) -> bool {
+    let tol = s.width * 0.5 + o_half_w + 2.0;
+    let s_min_x = s.a.x.min(s.b.x) - tol;
+    let s_max_x = s.a.x.max(s.b.x) + tol;
+    let s_min_y = s.a.y.min(s.b.y) - tol;
+    let s_max_y = s.a.y.max(s.b.y) + tol;
+    if oa.x.max(ob.x) < s_min_x
+        || oa.x.min(ob.x) > s_max_x
+        || oa.y.max(ob.y) < s_min_y
+        || oa.y.min(ob.y) > s_max_y
+    {
+        return false;
+    }
+    let ka = pt_key(s.a);
+    let kb = pt_key(s.b);
+    let koa = pt_key(oa);
+    let kob = pt_key(ob);
+    if (koa == ka && kob == kb) || (koa == kb && kob == ka) {
+        return true;
+    }
+    for (pt, kp) in [(oa, koa), (ob, kob)] {
+        if kp != ka && kp != kb {
+            let d = point_to_segment_dist(pt, s.a, s.b);
+            if d <= tol && d + 1e-3 < pt.dist(s.a).min(pt.dist(s.b)) {
+                return true;
+            }
+        }
+    }
+    if koa != ka && koa != kb && kob != ka && kob != kb {
+        let d = segment_to_segment_dist(s.a, s.b, oa, ob);
+        if d <= tol {
+            let ep_d = point_to_segment_dist(s.a, oa, ob).min(point_to_segment_dist(s.b, oa, ob));
+            if d + 1e-3 < ep_d {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Extracts maximal unbranched same-layer chains whose interior vertices have no pads,
 /// vias, tees, or interior T-junction taps.
 fn extract_chains(board: &Board, nr: &NetRoute) -> Vec<SegmentChain> {
@@ -322,44 +443,7 @@ fn extract_chains(board: &Board, nr: &NetRoute) -> Vec<SegmentChain> {
         adj.entry((s.layer, kb.0, kb.1)).or_default().push(i);
     }
 
-    let mut has_interior_tap = vec![false; nr.segments.len()];
-    let mut pts_by_layer: HashMap<usize, Vec<Point>> = HashMap::new();
-    for &(l, kx, ky) in &anchors {
-        pts_by_layer
-            .entry(l)
-            .or_default()
-            .push(Point::new(kx as f64 * 0.1, ky as f64 * 0.1));
-    }
-    for s in &nr.segments {
-        let list = pts_by_layer.entry(s.layer).or_default();
-        list.push(s.a);
-        list.push(s.b);
-    }
-    for (i, s) in nr.segments.iter().enumerate() {
-        let Some(layer_pts) = pts_by_layer.get(&s.layer) else {
-            continue;
-        };
-        let ka = pt_key(s.a);
-        let kb = pt_key(s.b);
-        let tol = s.width * 0.5 + 2.0;
-        let min_x = s.a.x.min(s.b.x) - tol;
-        let max_x = s.a.x.max(s.b.x) + tol;
-        let min_y = s.a.y.min(s.b.y) - tol;
-        let max_y = s.a.y.max(s.b.y) + tol;
-        for &pt in layer_pts {
-            if pt.x < min_x || pt.x > max_x || pt.y < min_y || pt.y > max_y {
-                continue;
-            }
-            let kp = pt_key(pt);
-            if kp == ka || kp == kb {
-                continue;
-            }
-            if point_to_segment_dist(pt, s.a, s.b) <= tol {
-                has_interior_tap[i] = true;
-                break;
-            }
-        }
-    }
+    let has_interior_tap = find_tapped_segments(board, nr);
 
     let is_interior = |layer: usize, width: f64, p: Point| -> Option<(usize, usize)> {
         let k = pt_key(p);
@@ -725,7 +809,7 @@ fn remove_redundant_vias(board: &Board, nr: &mut NetRoute) {
         .retain(|via| connected_layers_at(board, net_id, segments, via.pos, via.radius).len() >= 2);
 }
 
-fn segment_clear(
+pub(crate) fn segment_clear(
     board: &Board,
     net_id: usize,
     cand: &RoutedSegment,

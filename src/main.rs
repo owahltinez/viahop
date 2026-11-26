@@ -200,6 +200,7 @@ fn run(cli: CliArgs) -> Result<(), String> {
     }
 
     let board = Board::from_dsn(&design, &cli.ignored_nets, cli.via_at_smd)?;
+    cli.length_constraints.validate(&board)?;
     let initial_routes = if let Some(ref ses_path) = cli.initial_session {
         let ses_text = fs::read_to_string(ses_path)
             .map_err(|e| format!("failed to read initial session {ses_path}: {e}"))?;
@@ -208,7 +209,6 @@ fn run(cli: CliArgs) -> Result<(), String> {
         None
     };
 
-    let has_length_constraints = !cli.length_constraints.is_empty();
     let config = RouterConfig {
         max_passes: cli.max_passes,
         ignored_nets: cli.ignored_nets,
@@ -254,7 +254,7 @@ fn run(cli: CliArgs) -> Result<(), String> {
         println!("{}", s.to_json());
     } else if !cli.disable_log {
         let stopped = if s.stopped_early { " [stopped]" } else { "" };
-        let len_note = if has_length_constraints {
+        let len_note = if !config.length_constraints.is_empty() {
             format!(", {} length issues", s.length_violations)
         } else {
             String::new()
@@ -297,7 +297,7 @@ OPTIONS:\n  \
   --report <FILE>              Write detailed JSON report (stats, unrouted, violations)\n  \
   --diagnose                   With --report, classify unrouted pairs (congestion vs blocked)\n  \
   --ignore <LIST>              Comma-separated ignored net classes or nets (alias: -inc)\n  \
-  --max-length <SPEC>          Repeatable max length: NET[+NET2]=LEN (e.g. CLK=22mm, A+B=40mm)\n  \
+  --max-length <SPEC>          Repeatable max length: NET[,NET2|+NET2]=LEN (e.g. CLK=22mm, A,B=40mm)\n  \
   --match-group <SPEC>         Repeatable skew group: NAME:N1,N2,...:TOL[@TARGET] (e.g. QSPI:CLK,D0:0.5mm)\n  \
   --threads <N>                Worker threads, default 1 (alias: -mt)\n  \
   --rules <FILE>               Optional Specctra rules file (alias: -dr)\n  \

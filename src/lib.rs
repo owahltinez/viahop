@@ -22,9 +22,8 @@ pub use connectivity::RouteScore;
 pub use drc::{DrcReport, DrcViolation, check_drc};
 pub use dsn::DsnDesign;
 pub use length::{
-    LengthConstraints, LengthReport, LengthViolation, LengthViolationKind, MatchGroupConstraint,
-    MatchGroupMember, MatchGroupResult, MaxLengthConstraint, MaxLengthResult, evaluate_lengths,
-    net_total_length_um, parse_match_group_spec, parse_max_length_spec, tune_match_groups,
+    LengthConstraints, LengthReport, MatchGroupConstraint, MaxLengthConstraint,
+    parse_match_group_spec, parse_max_length_spec,
 };
 pub use report::{RouteReport, UnroutedConnection, UnroutedKind, ViolationDetail};
 pub use router::{RouteStats, RouterConfig, route_board, route_board_with_checkpoint};
@@ -65,6 +64,7 @@ impl RouteStats {
 /// Resolves `design` into a physical board and routes all non-ignored nets.
 pub fn route(design: &DsnDesign, config: &RouterConfig) -> Result<RouteResult, String> {
     let board = Board::from_dsn(design, &config.ignored_nets, config.via_at_smd)?;
+    config.length_constraints.validate(&board)?;
     let inner = router::route_board(&board, config);
     Ok(RouteResult {
         board,
@@ -84,6 +84,7 @@ where
     F: Fn(&Board, &[NetRoute], RouteScore) + Sync,
 {
     let board = Board::from_dsn(design, &config.ignored_nets, config.via_at_smd)?;
+    config.length_constraints.validate(&board)?;
     let hook = |routes: &[NetRoute], score: RouteScore| on_best(&board, routes, score);
     let inner = router::route_board_with_checkpoint(&board, config, Some(&hook));
     Ok(RouteResult {

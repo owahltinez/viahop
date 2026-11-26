@@ -335,7 +335,7 @@ pub fn parse_ses(input: &str, board: &Board) -> Result<Vec<NetRoute>, String> {
                 .unwrap_or(rules.width);
             let pts = parse_ses_points(path.get(3..).unwrap_or(&[]), ses_to_um);
             for pair in pts.windows(2) {
-                if pair[0].dist(pair[1]) > 0.5 {
+                if pair[0].dist(pair[1]) > 1e-6 {
                     nr.segments.push(RoutedSegment {
                         layer,
                         a: pair[0],

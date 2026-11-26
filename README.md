@@ -5,7 +5,7 @@ Fast, standalone, zero-dependency, MIT-licensed headless Specctra DSN/SES multi-
 ## Features
 
 - **Freerouting-compatible CLI + modern flags**: drop-in headless invocation (`-de`, `-do`, `-mp`, `-inc`, `-mt`, `-dr`, `-dl`, `--via-at-smd`, `--timeout`/`--max-time`, `--json-summary`) plus `--multi-start`, `--initial-session`, `--max-length`, `--match-group`, `--report`, and `--diagnose`.
-- **Length & skew constraints (`--max-length`, `--match-group`)**: prioritize length-budgeted nets (including `+`-chained series-resistor nets) and insert DRC-gated octilinear trombone meanders post-optimization to match bus and differential-pair lengths.
+- **Length & skew constraints (`--max-length`, `--match-group`)**: prioritize length-budgeted nets (including `,`- or `+`-chained series-resistor nets) and insert DRC-gated octilinear trombone meanders post-optimization to match bus and differential-pair lengths.
 - **Rust library + C-ABI (`rlib` + `cdylib`)**: direct in-process integration from Rust, C/C++, Python `ctypes`, or KiCad plugins (`include/viahop.h`).
 - **Parallel multi-start + bad-pass undo**: start 0 runs canonical ordering with zero overhead when clean; if unrouted pairs or DRC issues remain, shuffled seeds run in parallel and keep the best board while undoing degrading passes.
 - **Atomic checkpointing & graceful stop**: `-do` is updated atomically whenever a better solution is found; `Ctrl+C` (`SIGINT`/`SIGTERM`) or `--max-time` stops cleanly and keeps the best routed `.ses` on disk (a second signal exits immediately).
@@ -58,7 +58,7 @@ Flags:
 - `--max-passes <N>` (alias: `-mp`): max rip-up-and-reroute passes per start (default `20`)
 - `--multi-start <N>`: parallel shuffled starts if unrouted pairs or DRC issues remain (default `4`)
 - `--initial-session <FILE>`: resume routing/optimization from an existing `.ses` file
-- `--max-length <SPEC>`: repeatable max length constraint `NET[+NET2...]=LEN` (`mm`/`um`/`mil`, default `mm`)
+- `--max-length <SPEC>`: repeatable max length constraint `NET[,NET2...]=LEN` or `NET[+NET2...]=LEN` (`mm`/`um`/`mil`, default `mm`; use `,` when net names contain `+`)
 - `--match-group <SPEC>`: repeatable skew group `NAME:NET1,NET2,...:TOL[@TARGET]` with DRC-gated meander tuning
 - `--report <FILE>`: write detailed JSON report (stats, unrouted pairs, DRC violations, length checks)
 - `--diagnose`: with `--report`, classify unrouted pairs as `congestion` vs `blocked`

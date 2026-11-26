@@ -10,13 +10,15 @@ use std::time::{Duration, Instant};
 use crate::astar::{PassParams, SearchScratch, astar_connect, unpack_node};
 use crate::board::{Board, NetRoute, Pad, RoutedSegment, RoutedVia};
 use crate::connectivity::{
-    RouteScore, count_all_unconnected, count_unconnected_pairs, score_routes_with_constraints,
+    RouteScore, count_all_unconnected, count_unconnected_pairs, score_routes,
 };
 use crate::drc::{DrcReport, check_drc};
 use crate::fanout::{FanoutPlan, analyze_fanout};
 use crate::geometry::Point;
 use crate::grid::{NetFootprint, RoutingGrid};
-use crate::length::{LengthConstraints, evaluate_lengths, net_total_length_um, tune_match_groups};
+use crate::length::{
+    LengthConstraints, evaluate_lengths, net_total_length_um, tune_match_groups_with_context,
+};
 use crate::optimize::route_wirelength;
 use crate::signal;
 
@@ -175,6 +177,7 @@ where
         &net_components,
         &routable_nets,
         &canonical_order,
+        &max_len_nets,
         config,
         deadline,
         &notify_best,
@@ -203,6 +206,7 @@ where
                 let comps_ref = &net_components;
                 let routable_ref = &routable_nets;
                 let canon_ref = &canonical_order;
+                let max_len_ref = &max_len_nets;
                 let notify_ref = &notify_best;
                 let next_ref = &next_seed;
                 let perfect_ref = &found_perfect;
@@ -225,6 +229,7 @@ where
                             comps_ref,
                             routable_ref,
                             &order,
+                            max_len_ref,
                             config,
                             deadline,
                             notify_ref,
@@ -273,13 +278,7 @@ where
     let total_segments: usize = routes.iter().map(|r| r.segments.len()).sum();
     let total_vias: usize = routes.iter().map(|r| r.vias.len()).sum();
     let total_wirelength_um: f64 = routes.iter().map(route_wirelength).sum();
-    let length_violations = if config.length_constraints.is_empty() {
-        0
-    } else {
-        evaluate_lengths(board, &routes, &config.length_constraints)
-            .violations
-            .len()
-    };
+    let length_violations = best_outcome.score.length_violations;
 
     let stats = RouteStats {
         total_nets: board.nets.len(),
@@ -310,6 +309,7 @@ fn run_single_start<F>(
     net_components: &[Vec<Vec<Terminal>>],
     routable_nets: &[usize],
     net_order: &[usize],
+    max_len_nets: &HashSet<usize>,
     config: &RouterConfig,
     deadline: Option<Instant>,
     notify_best: &F,
@@ -329,6 +329,23 @@ where
         .map(|_| NetFootprint::default())
         .collect();
 
+    let max_len_only = LengthConstraints {
+        max_lengths: config.length_constraints.max_lengths.clone(),
+        match_groups: Vec::new(),
+    };
+    let full_score_for = |cur_routes: &[NetRoute], pf_score: RouteScore| -> RouteScore {
+        if config.length_constraints.match_groups.is_empty() {
+            pf_score
+        } else {
+            let lr = evaluate_lengths(board, cur_routes, &config.length_constraints);
+            RouteScore {
+                length_violations: lr.violations.len(),
+                length_excess_um: lr.violations.iter().map(|v| v.excess_um).sum(),
+                ..pf_score
+            }
+        }
+    };
+
     let has_initial = config.initial_routes.is_some();
     let mut best_routes: Vec<NetRoute> = routes.clone();
     let mut best_score = RouteScore::WORST;
@@ -347,19 +364,17 @@ where
                 footprints[nid] = grid.add_footprint(board, &routes[nid]);
             }
         }
-        let (init_score, init_drc) =
-            score_routes_with_constraints(board, &routes, &config.length_constraints);
+        let (init_score, init_drc) = score_routes(board, &routes, &max_len_only);
         best_score = init_score;
         best_routes = routes.clone();
         last_drc = Some(init_drc);
-        notify_best(&best_routes, best_score);
+        notify_best(&best_routes, full_score_for(&best_routes, best_score));
     } else {
         for &nid in routable_nets {
             routes[nid].unconnected_pairs = net_components[nid].len().saturating_sub(1);
         }
     }
 
-    let max_len_nets = config.length_constraints.max_length_net_ids(board);
     let n3d = grid.sig_layers.len() * grid.n2d();
     let mut scratch = SearchScratch::new(n3d);
     let effective_passes = if has_initial {
@@ -369,6 +384,7 @@ where
     };
     let mut passes_run = 0;
     let mut stopped_early = false;
+    let mut max_len_punch_attempts = 0usize;
 
     for pass in 0..effective_passes {
         if is_cancelled(deadline, config.stop_flag.as_ref(), peer_perfect) {
@@ -396,7 +412,7 @@ where
         } else {
             HashSet::new()
         };
-        let mut only_max_len_dirty = false;
+        let mut violating_len_before: Option<f64> = None;
         let to_route: Vec<usize> = if pass == 0 && !has_initial {
             net_order.to_vec()
         } else {
@@ -427,7 +443,12 @@ where
                 }
             }
             if dirty.is_empty() && !violating_max_len.is_empty() {
-                only_max_len_dirty = true;
+                violating_len_before = Some(
+                    violating_max_len
+                        .iter()
+                        .map(|&nid| net_total_length_um(board, &routes, nid))
+                        .sum(),
+                );
             }
             for &nid in net_order {
                 if violating_max_len.contains(&nid) && !dirty.contains(&nid) {
@@ -460,14 +481,10 @@ where
             dirty
         };
 
-        let violating_len_before: f64 = if only_max_len_dirty {
-            violating_max_len
-                .iter()
-                .map(|&nid| net_total_length_um(board, &routes, nid))
-                .sum()
-        } else {
-            0.0
-        };
+        let punch_max_len = !violating_max_len.is_empty() && max_len_punch_attempts < 4;
+        if punch_max_len {
+            max_len_punch_attempts += 1;
+        }
 
         last_drc = None;
         for &nid in &to_route {
@@ -478,22 +495,16 @@ where
             grid.remove_footprint(&footprints[nid]);
             let net_params = if violating_max_len.contains(&nid) {
                 PassParams {
-                    present_factor: if pass < 6 {
+                    present_factor: if punch_max_len {
                         params.present_factor.min(0.6)
                     } else {
                         params.present_factor
                     },
                     h_weight: (params.h_weight + 0.85).max(2.15),
-                    strict_mode: params.strict_mode,
-                    max_expansions: params.max_expansions,
+                    ..params
                 }
             } else {
-                PassParams {
-                    present_factor: params.present_factor,
-                    h_weight: params.h_weight,
-                    strict_mode: params.strict_mode,
-                    max_expansions: params.max_expansions,
-                }
+                params
             };
             let nr = route_single_net(
                 board,
@@ -516,24 +527,26 @@ where
             || pass + 1 == effective_passes
             || unconn < best_score.unconnected_pairs;
         if need_drc {
-            let (pass_score, pass_drc) =
-                score_routes_with_constraints(board, &routes, &config.length_constraints);
+            let (pass_score, pass_drc) = score_routes(board, &routes, &max_len_only);
             if pass_score.is_better_than(best_score) {
                 best_score = pass_score;
                 best_routes = routes.clone();
-                notify_best(&best_routes, best_score);
+                notify_best(&best_routes, full_score_for(&best_routes, best_score));
             }
             if pass_score.is_perfect() {
                 last_drc = Some(pass_drc);
                 break;
             }
-            if only_max_len_dirty && congested == 0 && unconn == 0 && pass_drc.violations.is_empty()
+            if let Some(len_before) = violating_len_before
+                && congested == 0
+                && unconn == 0
+                && pass_drc.violations.is_empty()
             {
-                let violating_len_after: f64 = violating_max_len
+                let len_after: f64 = violating_max_len
                     .iter()
                     .map(|&nid| net_total_length_um(board, &routes, nid))
                     .sum();
-                if violating_len_after + 1.0 >= violating_len_before {
+                if len_after + 1.0 >= len_before {
                     last_drc = Some(pass_drc);
                     break;
                 }
@@ -675,12 +688,11 @@ where
                 routes[nid] = final_nr;
             }
 
-            let (round_score, round_drc) =
-                score_routes_with_constraints(board, &routes, &config.length_constraints);
+            let (round_score, round_drc) = score_routes(board, &routes, &max_len_only);
             if round_score.is_better_than(best_score) {
                 best_score = round_score;
                 best_routes = routes.clone();
-                notify_best(&best_routes, best_score);
+                notify_best(&best_routes, full_score_for(&best_routes, best_score));
             }
             last_drc = Some(round_drc);
             if best_score.is_perfect() {
@@ -695,15 +707,47 @@ where
     }
 
     count_all_unconnected(board, net_components, &mut routes, routable_nets);
-    let (pre_score, _) = score_routes_with_constraints(board, &routes, &config.length_constraints);
-    if config.optimize {
+    let (pre_score, _) = score_routes(board, &routes, &config.length_constraints);
+    let has_match_groups = !config.length_constraints.match_groups.is_empty();
+    if config.optimize || has_match_groups {
         let pre_opt = routes.clone();
-        crate::optimize::optimize_routes(board, &mut routes);
+        if config.optimize {
+            crate::optimize::optimize_routes(board, &mut routes);
+            if has_match_groups {
+                count_all_unconnected(board, net_components, &mut routes, routable_nets);
+                let (opt_score, _) = score_routes(board, &routes, &max_len_only);
+                if opt_score.unconnected_pairs > pre_score.unconnected_pairs
+                    || opt_score.drc_violations > pre_score.drc_violations
+                {
+                    routes = pre_opt.clone();
+                }
+            }
+        }
+        // Run meander tuning after pull-tight so optimization never collapses inserted meanders.
+        if has_match_groups {
+            if stopped_early || is_cancelled(deadline, config.stop_flag.as_ref(), peer_perfect) {
+                stopped_early = true;
+            } else {
+                let cancel_check =
+                    || is_cancelled(deadline, config.stop_flag.as_ref(), peer_perfect);
+                tune_match_groups_with_context(
+                    board,
+                    &mut routes,
+                    &config.length_constraints,
+                    Some(net_components),
+                    &cancel_check,
+                );
+                if cancel_check() {
+                    stopped_early = true;
+                }
+            }
+        }
         count_all_unconnected(board, net_components, &mut routes, routable_nets);
-        let (post_score, _) =
-            score_routes_with_constraints(board, &routes, &config.length_constraints);
+        let (post_score, _) = score_routes(board, &routes, &config.length_constraints);
         if post_score.unconnected_pairs <= pre_score.unconnected_pairs
             && post_score.drc_violations <= pre_score.drc_violations
+            && post_score.length_violations <= pre_score.length_violations
+            && post_score.length_excess_um <= pre_score.length_excess_um + 0.1
         {
             best_score = post_score;
             notify_best(&routes, best_score);
@@ -713,26 +757,6 @@ where
         }
     } else {
         best_score = pre_score;
-    }
-
-    // Run meander tuning after pull-tight so optimization never collapses inserted meanders.
-    if !config.length_constraints.match_groups.is_empty() {
-        let pre_tune = routes.clone();
-        let pre_tune_score = best_score;
-        tune_match_groups(board, &mut routes, &config.length_constraints);
-        count_all_unconnected(board, net_components, &mut routes, routable_nets);
-        let (post_tune_score, _) =
-            score_routes_with_constraints(board, &routes, &config.length_constraints);
-        if post_tune_score.unconnected_pairs <= pre_tune_score.unconnected_pairs
-            && post_tune_score.drc_violations <= pre_tune_score.drc_violations
-            && post_tune_score.length_violations <= pre_tune_score.length_violations
-        {
-            best_score = post_tune_score;
-            notify_best(&routes, best_score);
-        } else {
-            routes = pre_tune;
-            best_score = pre_tune_score;
-        }
     }
 
     StartOutcome {
@@ -984,12 +1008,8 @@ fn emit_landing(
     }
 }
 
-pub(crate) fn build_net_components(
-    board: &Board,
-    grid: &RoutingGrid,
-    fanout: &FanoutPlan,
-    net_id: usize,
-) -> Vec<Vec<Terminal>> {
+/// Builds physical copper components (pads plus fixed wires/vias) without grid entries.
+pub(crate) fn build_physical_components(board: &Board, net_id: usize) -> Vec<Vec<Terminal>> {
     let pads = &board.nets[net_id].pad_ids;
     if pads.len() < 2 {
         return Vec::new();
@@ -1045,25 +1065,39 @@ pub(crate) fn build_net_components(
         }
     }
 
-    let mut sbuf = Vec::new();
     let mut comp_map: BTreeMap<usize, Vec<Terminal>> = BTreeMap::new();
     for (i, (pt, layers, pad_opt)) in nodes.iter().enumerate() {
         let root = uf_find(&mut uf, i);
         if i >= pad_count && !comp_map.contains_key(&root) {
             continue;
         }
-        let entries = compute_terminal_entries(
-            board, grid, fanout, net_id, *pt, layers, *pad_opt, &mut sbuf,
-        );
         comp_map.entry(root).or_default().push(Terminal {
             exact: *pt,
             pad_id: *pad_opt,
             layers: layers.clone(),
-            entries,
+            entries: Vec::new(),
         });
     }
 
     comp_map.into_values().collect()
+}
+
+pub(crate) fn build_net_components(
+    board: &Board,
+    grid: &RoutingGrid,
+    fanout: &FanoutPlan,
+    net_id: usize,
+) -> Vec<Vec<Terminal>> {
+    let mut comps = build_physical_components(board, net_id);
+    let mut sbuf = Vec::new();
+    for comp in &mut comps {
+        for t in comp {
+            t.entries = compute_terminal_entries(
+                board, grid, fanout, net_id, t.exact, &t.layers, t.pad_id, &mut sbuf,
+            );
+        }
+    }
+    comps
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -8,6 +8,7 @@ use crate::grid::RoutingGrid;
 
 const SQRT2: f32 = std::f32::consts::SQRT_2;
 
+#[derive(Clone, Copy)]
 pub(crate) struct PassParams {
     pub(crate) present_factor: f32,
     pub(crate) h_weight: f32,

@@ -226,7 +226,7 @@ impl RouteReport {
             let _ = writeln!(
                 out,
                 "    {{\"kind\":{},\"name\":{},\"nets\":[{}],\"actual_um\":{:.1},\"limit_um\":{:.1},\"excess_um\":{:.1}}}{comma}",
-                json_str(lv.kind.as_str()),
+                json_str(lv.kind),
                 json_str(&lv.name),
                 nets_json.join(","),
                 lv.actual_um,

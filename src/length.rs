@@ -5,11 +5,18 @@ use std::collections::{HashMap, HashSet};
 use std::f64::consts::SQRT_2;
 
 use crate::board::{Board, NetRoute, RoutedSegment};
+use crate::connectivity::count_unconnected_pairs;
 use crate::drc::check_drc;
-use crate::geometry::{Point, point_to_segment_dist, segment_to_segment_dist};
-use crate::optimize::{RouteSpatialIndex, is_octilinear, pt_key, route_wirelength};
+use crate::geometry::{BBox, Point, point_to_segment_dist, segment_to_segment_dist};
+use crate::optimize::{
+    RouteSpatialIndex, find_tapped_segments, is_octilinear, route_wirelength, segment_clear,
+};
+use crate::router::{Terminal, build_physical_components};
 
-/// Maximum total copper length budget across one net or a `+`-chained series of nets.
+const LENGTH_TOL_EPS_UM: f64 = 0.5;
+const MIN_BUMP_H_UM: f64 = 0.4;
+
+/// Maximum total copper length budget across one net or a chained series of nets.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MaxLengthConstraint {
     pub nets: Vec<String>,
@@ -37,11 +44,47 @@ impl LengthConstraints {
         self.max_lengths.is_empty() && self.match_groups.is_empty()
     }
 
+    /// Validates that every constrained net exists on `board` and is not ignored.
+    pub fn validate(&self, board: &Board) -> Result<(), String> {
+        for ml in &self.max_lengths {
+            let label = ml.nets.join("+");
+            for (name, nid_opt) in resolve_max_length_nets(board, ml) {
+                let Some(nid) = nid_opt else {
+                    return Err(format!(
+                        "--max-length '{label}' references unknown net '{name}'"
+                    ));
+                };
+                if board.nets[nid].ignored {
+                    return Err(format!(
+                        "--max-length '{label}' references ignored net '{name}'"
+                    ));
+                }
+            }
+        }
+        for mg in &self.match_groups {
+            for name in &mg.nets {
+                let Some(&nid) = board.net_name_to_id.get(name) else {
+                    return Err(format!(
+                        "--match-group '{}' references unknown net '{name}'",
+                        mg.name
+                    ));
+                };
+                if board.nets[nid].ignored {
+                    return Err(format!(
+                        "--match-group '{}' references ignored net '{name}'",
+                        mg.name
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn max_length_net_ids(&self, board: &Board) -> HashSet<usize> {
         let mut ids = HashSet::new();
         for ml in &self.max_lengths {
-            for name in &ml.nets {
-                if let Some(&nid) = board.net_name_to_id.get(name) {
+            for (_, nid_opt) in resolve_max_length_nets(board, ml) {
+                if let Some(nid) = nid_opt {
                     ids.insert(nid);
                 }
             }
@@ -56,42 +99,19 @@ impl LengthConstraints {
     ) -> HashSet<usize> {
         let mut ids = HashSet::new();
         for ml in &self.max_lengths {
-            let mut resolved = Vec::with_capacity(ml.nets.len());
-            let mut total = 0.0;
-            for name in &ml.nets {
-                if let Some(&nid) = board.net_name_to_id.get(name) {
-                    resolved.push(nid);
-                    total += net_total_length_um(board, routes, nid);
-                }
-            }
-            if !resolved.is_empty() && total > ml.max_um + 0.5 {
-                ids.extend(resolved);
+            let m = measure_max_length(board, routes, ml);
+            if m.exceeds_budget {
+                ids.extend(m.net_ids);
             }
         }
         ids
     }
 }
 
-/// Category of a length or skew constraint violation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LengthViolationKind {
-    MaxLength,
-    MatchGroup,
-}
-
-impl LengthViolationKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::MaxLength => "max_length",
-            Self::MatchGroup => "match_group",
-        }
-    }
-}
-
 /// A single violated max-length or match-group constraint.
 #[derive(Debug, Clone)]
 pub struct LengthViolation {
-    pub kind: LengthViolationKind,
+    pub kind: &'static str,
     pub name: String,
     pub nets: Vec<String>,
     pub actual_um: f64,
@@ -156,28 +176,55 @@ fn parse_length_um(raw: &str) -> Result<f64, String> {
         .trim()
         .parse::<f64>()
         .map_err(|_| format!("invalid length value: {raw}"))?;
-    if !val.is_finite() || val <= 0.0 {
+    let um = val * scale;
+    if !val.is_finite() || val <= 0.0 || !um.is_finite() || um <= 0.0 {
         return Err(format!("length must be positive and finite: {raw}"));
     }
-    Ok(val * scale)
+    Ok(um)
 }
 
-/// Parses `NET[+NET2...]=LEN` (e.g. `CLK=22mm` or `/A+/B=40mm`).
+/// Parses `NET[,NET2...|+NET2...]=LEN` (e.g. `CLK=22mm`, `/A,/B=40mm`, or `/A+/B=40mm`).
 pub fn parse_max_length_spec(spec: &str) -> Result<MaxLengthConstraint, String> {
-    let (lhs, rhs) = spec
+    let (lhs_raw, rhs) = spec
         .split_once('=')
         .ok_or_else(|| format!("invalid --max-length spec (expected NET=LEN): {spec}"))?;
+    let lhs = lhs_raw.trim();
     let mut nets = Vec::new();
-    for tok in lhs.split('+') {
-        let name = tok.trim();
-        if name.is_empty() {
+    let mut seen = HashSet::new();
+
+    if lhs.contains(',') {
+        for tok in lhs.split(',') {
+            let name = tok.trim();
+            if name.is_empty() {
+                return Err(format!("empty net name in --max-length spec: {spec}"));
+            }
+            if !seen.insert(name.to_string()) {
+                return Err(format!(
+                    "duplicate net '{name}' in --max-length spec: {spec}"
+                ));
+            }
+            nets.push(name.to_string());
+        }
+    } else if lhs.starts_with('+') || lhs.ends_with('+') {
+        if lhs.chars().all(|c| c == '+') {
             return Err(format!("empty net name in --max-length spec: {spec}"));
         }
-        nets.push(name.to_string());
+        nets.push(lhs.to_string());
+    } else {
+        for tok in lhs.split('+') {
+            let name = tok.trim();
+            if name.is_empty() {
+                return Err(format!("empty net name in --max-length spec: {spec}"));
+            }
+            if !seen.insert(name.to_string()) {
+                return Err(format!(
+                    "duplicate net '{name}' in --max-length spec: {spec}"
+                ));
+            }
+            nets.push(name.to_string());
+        }
     }
-    if nets.is_empty() {
-        return Err(format!("no nets in --max-length spec: {spec}"));
-    }
+
     let max_um =
         parse_length_um(rhs).map_err(|e| format!("invalid --max-length value in '{spec}': {e}"))?;
     Ok(MaxLengthConstraint { nets, max_um })
@@ -234,13 +281,16 @@ pub fn parse_match_group_spec(spec: &str) -> Result<MatchGroupConstraint, String
 
 /// Computes total copper length (routed segments plus board fixed segments) for `net_id` in um.
 pub fn net_total_length_um(board: &Board, routes: &[NetRoute], net_id: usize) -> f64 {
-    let routed = routes
+    let routed = find_net_route(routes, net_id).map_or(0.0, route_wirelength);
+    let fixed = net_fixed_length_um(board, net_id);
+    routed + fixed
+}
+
+fn find_net_route(routes: &[NetRoute], net_id: usize) -> Option<&NetRoute> {
+    routes
         .get(net_id)
         .filter(|r| r.net_id == net_id)
         .or_else(|| routes.iter().find(|r| r.net_id == net_id))
-        .map_or(0.0, route_wirelength);
-    let fixed = net_fixed_length_um(board, net_id);
-    routed + fixed
 }
 
 fn net_fixed_length_um(board: &Board, net_id: usize) -> f64 {
@@ -250,6 +300,80 @@ fn net_fixed_length_um(board: &Board, net_id: usize) -> f64 {
         .filter(|s| s.net_id == Some(net_id))
         .map(|s| s.a.dist(s.b))
         .sum()
+}
+
+fn net_is_unrouted(board: &Board, routes: &[NetRoute], net_id: usize) -> bool {
+    if board.nets[net_id].ignored {
+        return true;
+    }
+    let nr_opt = find_net_route(routes, net_id);
+    if nr_opt.is_some_and(|nr| nr.unconnected_pairs > 0) {
+        return true;
+    }
+    if board.nets[net_id].pad_ids.len() < 2 {
+        return false;
+    }
+    if nr_opt.is_none_or(|nr| nr.segments.is_empty()) {
+        return build_physical_components(board, net_id).len() > 1;
+    }
+    false
+}
+
+fn resolve_max_length_nets(
+    board: &Board,
+    ml: &MaxLengthConstraint,
+) -> Vec<(String, Option<usize>)> {
+    if ml.nets.len() > 1 {
+        let joined = ml.nets.join("+");
+        if let Some(&nid) = board.net_name_to_id.get(&joined) {
+            return vec![(joined, Some(nid))];
+        }
+    }
+    ml.nets
+        .iter()
+        .map(|name| (name.clone(), board.net_name_to_id.get(name).copied()))
+        .collect()
+}
+
+struct MaxLengthMeasurement {
+    nets: Vec<String>,
+    net_ids: Vec<usize>,
+    actual_um: f64,
+    has_invalid_or_unrouted: bool,
+    exceeds_budget: bool,
+}
+
+fn measure_max_length(
+    board: &Board,
+    routes: &[NetRoute],
+    ml: &MaxLengthConstraint,
+) -> MaxLengthMeasurement {
+    let resolved = resolve_max_length_nets(board, ml);
+    let mut nets = Vec::with_capacity(resolved.len());
+    let mut net_ids = Vec::with_capacity(resolved.len());
+    let mut actual_um = 0.0;
+    let mut has_invalid_or_unrouted = resolved.is_empty();
+    for (name, nid_opt) in resolved {
+        nets.push(name);
+        match nid_opt {
+            Some(nid) => {
+                net_ids.push(nid);
+                if net_is_unrouted(board, routes, nid) {
+                    has_invalid_or_unrouted = true;
+                }
+                actual_um += net_total_length_um(board, routes, nid);
+            }
+            None => has_invalid_or_unrouted = true,
+        }
+    }
+    let exceeds_budget = !net_ids.is_empty() && actual_um > ml.max_um + LENGTH_TOL_EPS_UM;
+    MaxLengthMeasurement {
+        nets,
+        net_ids,
+        actual_um,
+        has_invalid_or_unrouted,
+        exceeds_budget,
+    }
 }
 
 /// Evaluates all max-length and match-group constraints against current routed + fixed copper.
@@ -264,28 +388,21 @@ pub fn evaluate_lengths(
     }
 
     for ml in &constraints.max_lengths {
-        let mut actual_um = 0.0;
-        let mut found_any = false;
-        for name in &ml.nets {
-            if let Some(&nid) = board.net_name_to_id.get(name) {
-                found_any = true;
-                actual_um += net_total_length_um(board, routes, nid);
-            }
-        }
-        let passed = !found_any || actual_um <= ml.max_um + 0.5;
+        let m = measure_max_length(board, routes, ml);
+        let passed = !m.has_invalid_or_unrouted && !m.exceeds_budget;
         if !passed {
             report.violations.push(LengthViolation {
-                kind: LengthViolationKind::MaxLength,
-                name: ml.nets.join("+"),
-                nets: ml.nets.clone(),
-                actual_um,
+                kind: "max_length",
+                name: m.nets.join("+"),
+                nets: m.nets.clone(),
+                actual_um: m.actual_um,
                 limit_um: ml.max_um,
-                excess_um: actual_um - ml.max_um,
+                excess_um: (m.actual_um - ml.max_um).max(0.0),
             });
         }
         report.max_lengths.push(MaxLengthResult {
-            nets: ml.nets.clone(),
-            actual_um,
+            nets: m.nets,
+            actual_um: m.actual_um,
             max_um: ml.max_um,
             passed,
         });
@@ -293,15 +410,30 @@ pub fn evaluate_lengths(
 
     for mg in &constraints.match_groups {
         let mut members = Vec::with_capacity(mg.nets.len());
+        let mut has_invalid_or_unrouted = false;
         for name in &mg.nets {
-            if let Some(&nid) = board.net_name_to_id.get(name) {
-                members.push(MatchGroupMember {
-                    net: name.clone(),
-                    length_um: net_total_length_um(board, routes, nid),
-                });
+            match board.net_name_to_id.get(name) {
+                Some(&nid) => {
+                    if net_is_unrouted(board, routes, nid) {
+                        has_invalid_or_unrouted = true;
+                    }
+                    members.push(MatchGroupMember {
+                        net: name.clone(),
+                        length_um: net_total_length_um(board, routes, nid),
+                    });
+                }
+                None => has_invalid_or_unrouted = true,
             }
         }
         if members.is_empty() {
+            report.violations.push(LengthViolation {
+                kind: "match_group",
+                name: mg.name.clone(),
+                nets: mg.nets.clone(),
+                actual_um: 0.0,
+                limit_um: mg.tolerance_um,
+                excess_um: 0.0,
+            });
             report.match_groups.push(MatchGroupResult {
                 name: mg.name.clone(),
                 members,
@@ -310,7 +442,7 @@ pub fn evaluate_lengths(
                 target_um: mg.target_um.unwrap_or(0.0),
                 skew_um: 0.0,
                 tolerance_um: mg.tolerance_um,
-                passed: true,
+                passed: false,
             });
             continue;
         }
@@ -332,15 +464,15 @@ pub fn evaluate_lengths(
             None => 0.0,
         };
         let worst_err = skew_um.max(max_target_dev);
-        let passed = worst_err <= mg.tolerance_um + 0.5;
+        let passed = !has_invalid_or_unrouted && worst_err <= mg.tolerance_um + LENGTH_TOL_EPS_UM;
         if !passed {
             report.violations.push(LengthViolation {
-                kind: LengthViolationKind::MatchGroup,
+                kind: "match_group",
                 name: mg.name.clone(),
                 nets: mg.nets.clone(),
                 actual_um: worst_err,
                 limit_um: mg.tolerance_um,
-                excess_um: worst_err - mg.tolerance_um,
+                excess_um: (worst_err - mg.tolerance_um).max(0.0),
             });
         }
         report.match_groups.push(MatchGroupResult {
@@ -360,7 +492,17 @@ pub fn evaluate_lengths(
 
 /// Inserts DRC-gated octilinear trombone meanders into shorter match-group members.
 pub fn tune_match_groups(board: &Board, routes: &mut [NetRoute], constraints: &LengthConstraints) {
-    if constraints.match_groups.is_empty() {
+    tune_match_groups_with_context(board, routes, constraints, None, &|| false);
+}
+
+pub(crate) fn tune_match_groups_with_context(
+    board: &Board,
+    routes: &mut [NetRoute],
+    constraints: &LengthConstraints,
+    net_components: Option<&[Vec<Vec<Terminal>>]>,
+    is_cancelled: &dyn Fn() -> bool,
+) {
+    if constraints.match_groups.is_empty() || is_cancelled() {
         return;
     }
 
@@ -373,79 +515,160 @@ pub fn tune_match_groups(board: &Board, routes: &mut [NetRoute], constraints: &L
     let mut qbuf = Vec::new();
     let mut sbuf = Vec::new();
     let base_drc = check_drc(board, routes).violations.len();
+    let mut local_comps: HashMap<usize, Vec<Vec<Terminal>>> = HashMap::new();
 
-    for group in &constraints.match_groups {
-        let mut member_nids = Vec::with_capacity(group.nets.len());
-        for name in &group.nets {
-            if let Some(&nid) = board.net_name_to_id.get(name)
-                && !board.nets[nid].ignored
-            {
-                member_nids.push(nid);
-            }
+    let max_outer = constraints.match_groups.len().min(4);
+    for _pass in 0..max_outer {
+        if is_cancelled() {
+            break;
         }
-        if member_nids.len() < 2 && group.target_um.is_none() {
-            continue;
-        }
-        if member_nids.is_empty() {
-            continue;
-        }
-
-        let lengths: Vec<(usize, f64)> = member_nids
+        // Process highest-target groups first so shared nets settle before shorter peers tune.
+        let mut group_order: Vec<(usize, f64)> = constraints
+            .match_groups
             .iter()
-            .map(|&nid| (nid, net_total_length_um(board, routes, nid)))
+            .enumerate()
+            .map(|(gi, group)| {
+                let target = group_target_um(board, routes, constraints, group).unwrap_or(0.0);
+                (gi, target)
+            })
             .collect();
-        let max_len = lengths.iter().map(|&(_, l)| l).fold(0.0_f64, f64::max);
+        group_order.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
 
-        let mut target = group.target_um.unwrap_or(max_len);
-        if group.target_um.is_none() {
+        let mut any_net_changed = false;
+        for (gi, _) in group_order {
+            if is_cancelled() {
+                return;
+            }
+            let group = &constraints.match_groups[gi];
+            let member_nids = active_group_net_ids(board, group);
+            if member_nids.is_empty() || (member_nids.len() < 2 && group.target_um.is_none()) {
+                continue;
+            }
+            let Some(target) = group_target_um(board, routes, constraints, group) else {
+                continue;
+            };
+            let stop_eps = tune_stop_eps(group.tolerance_um);
+
+            // Tune nets with the largest deficit first so they get priority on open corridors.
+            let mut work: Vec<(usize, usize, f64)> = Vec::new();
             for &nid in &member_nids {
-                if let Some(cap) = member_max_length_cap(board, routes, constraints, nid) {
-                    target = target.min(cap);
+                let Some(&ridx) = route_idx_by_net.get(&nid) else {
+                    continue;
+                };
+                if routes[ridx].segments.is_empty() || routes[ridx].unconnected_pairs > 0 {
+                    continue;
+                }
+                let cur_len = net_total_length_um(board, routes, nid);
+                let cap = member_max_length_cap(board, routes, constraints, nid)
+                    .map_or(target, |c| target.min(c));
+                if cur_len < cap - stop_eps {
+                    work.push((nid, ridx, cap - cur_len));
+                }
+            }
+            work.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(Ordering::Equal));
+
+            for (nid, ridx, _) in work {
+                if is_cancelled() {
+                    return;
+                }
+                let cap = member_max_length_cap(board, routes, constraints, nid)
+                    .map_or(target, |c| target.min(c));
+                let comps: &[Vec<Terminal>] = match net_components {
+                    Some(all) => &all[nid],
+                    None => local_comps
+                        .entry(nid)
+                        .or_insert_with(|| build_physical_components(board, nid)),
+                };
+                let base_unconn = count_unconnected_pairs(board, comps, &routes[ridx]);
+                let saved = routes[ridx].clone();
+                let target_spec = TuneTarget {
+                    route_idx: ridx,
+                    fixed_len: net_fixed_length_um(board, nid),
+                    target_um: cap,
+                    tolerance_um: group.tolerance_um,
+                };
+                let changed = tune_single_net(
+                    board,
+                    &mut routes[ridx],
+                    target_spec,
+                    &mut index,
+                    &mut qbuf,
+                    &mut sbuf,
+                    is_cancelled,
+                );
+                if changed {
+                    let new_unconn = count_unconnected_pairs(board, comps, &routes[ridx]);
+                    if new_unconn > base_unconn
+                        || check_drc(board, routes).violations.len() > base_drc
+                    {
+                        routes[ridx] = saved;
+                        index.update_net(ridx, &routes[ridx]);
+                    } else {
+                        routes[ridx].unconnected_pairs = new_unconn;
+                        any_net_changed = true;
+                    }
                 }
             }
         }
+        if !any_net_changed {
+            break;
+        }
+    }
+}
 
-        // Tune nets with the largest deficit first so they get priority on open corridors.
-        let mut work: Vec<(usize, usize, f64)> = Vec::new();
-        for &(nid, cur_len) in &lengths {
-            let Some(&ridx) = route_idx_by_net.get(&nid) else {
-                continue;
-            };
-            if routes[ridx].segments.is_empty() || routes[ridx].unconnected_pairs > 0 {
-                continue;
-            }
-            let cap = member_max_length_cap(board, routes, constraints, nid)
-                .map_or(target, |c| target.min(c));
-            let needs_tune = cur_len < cap - group.tolerance_um
-                || (max_len - cur_len > group.tolerance_um && cur_len + 5.0 < cap);
-            if needs_tune && cap > cur_len + 5.0 {
-                work.push((nid, ridx, cap - cur_len));
+fn active_group_net_ids(board: &Board, group: &MatchGroupConstraint) -> Vec<usize> {
+    group
+        .nets
+        .iter()
+        .filter_map(|name| {
+            board
+                .net_name_to_id
+                .get(name)
+                .copied()
+                .filter(|&nid| !board.nets[nid].ignored)
+        })
+        .collect()
+}
+
+fn group_target_um(
+    board: &Board,
+    routes: &[NetRoute],
+    constraints: &LengthConstraints,
+    group: &MatchGroupConstraint,
+) -> Option<f64> {
+    let member_nids = active_group_net_ids(board, group);
+    if member_nids.is_empty() {
+        return None;
+    }
+    let max_len = member_nids
+        .iter()
+        .map(|&nid| net_total_length_um(board, routes, nid))
+        .fold(0.0_f64, f64::max);
+    let mut target = match group.target_um {
+        Some(t) => {
+            if max_len > t && max_len <= t + group.tolerance_um + LENGTH_TOL_EPS_UM {
+                max_len.min(t + group.tolerance_um)
+            } else {
+                t
             }
         }
-        work.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(Ordering::Equal));
-
-        for (nid, ridx, _) in work {
-            let cap = member_max_length_cap(board, routes, constraints, nid)
-                .map_or(target, |c| target.min(c));
-            let saved = routes[ridx].clone();
-            let fixed_len = net_fixed_length_um(board, nid);
-            let changed = tune_single_net(
-                board,
-                &mut routes[ridx],
-                ridx,
-                fixed_len,
-                cap,
-                group.tolerance_um,
-                &mut index,
-                &mut qbuf,
-                &mut sbuf,
-            );
-            if changed && check_drc(board, routes).violations.len() > base_drc {
-                routes[ridx] = saved;
-                index.update_net(ridx, &routes[ridx]);
+        None => max_len,
+    };
+    if group.target_um.is_none() {
+        for &nid in &member_nids {
+            if let Some(cap) = member_max_length_cap(board, routes, constraints, nid) {
+                target = target.min(cap);
             }
         }
     }
+    Some(target)
+}
+
+#[inline]
+fn tune_stop_eps(tolerance_um: f64) -> f64 {
+    (tolerance_um * 0.15)
+        .min(40.0)
+        .max((tolerance_um * 0.25).min(0.5))
 }
 
 /// Tightest upper length limit for `net_id` implied by any `--max-length` constraint.
@@ -455,20 +678,17 @@ fn member_max_length_cap(
     constraints: &LengthConstraints,
     net_id: usize,
 ) -> Option<f64> {
-    let target_name = &board.nets[net_id].name;
     let mut best: Option<f64> = None;
     for ml in &constraints.max_lengths {
-        if !ml.nets.iter().any(|n| n == target_name) {
+        let resolved = resolve_max_length_nets(board, ml);
+        if !resolved.iter().any(|&(_, oid)| oid == Some(net_id)) {
             continue;
         }
-        let mut other_sum = 0.0;
-        for n in &ml.nets {
-            if n != target_name
-                && let Some(&oid) = board.net_name_to_id.get(n)
-            {
-                other_sum += net_total_length_um(board, routes, oid);
-            }
-        }
+        let other_sum: f64 = resolved
+            .iter()
+            .filter_map(|&(_, oid)| oid.filter(|&id| id != net_id))
+            .map(|oid| net_total_length_um(board, routes, oid))
+            .sum();
         let cap = (ml.max_um - other_sum).max(0.0);
         best = Some(best.map_or(cap, |b| b.min(cap)));
     }
@@ -478,39 +698,67 @@ fn member_max_length_cap(
 /// Added length of a chamfered octilinear bump of height `h` and chamfer leg `c`.
 #[inline]
 fn delta_for_height(h: f64, c: f64) -> f64 {
-    if h <= 2.0 * c {
+    if h <= 2.0 * c + 0.5 {
         2.0 * (SQRT_2 - 1.0) * h
     } else {
         2.0 * h - 4.0 * c * (2.0 - SQRT_2)
     }
 }
 
-/// Exact inverse of `delta_for_height`: bump height needed to add `delta` um.
+/// Exact inverse of `delta_for_height`: bump height needed to add `delta` um without overshoot.
 #[inline]
 fn height_for_delta(delta: f64, c: f64) -> f64 {
-    let switch = 4.0 * (SQRT_2 - 1.0) * c;
-    if delta <= switch {
+    let switch_4pt = 2.0 * (SQRT_2 - 1.0) * (2.0 * c + 0.5);
+    let switch_8pt = 4.0 * (SQRT_2 - 1.0) * c + 1.0;
+    if delta <= switch_4pt {
         delta / (2.0 * (SQRT_2 - 1.0))
+    } else if delta <= switch_8pt {
+        2.0 * c + 0.5
     } else {
         0.5 * delta + 2.0 * c * (2.0 - SQRT_2)
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn tune_single_net(
-    board: &Board,
-    nr: &mut NetRoute,
+struct TuneTarget {
     route_idx: usize,
     fixed_len: f64,
     target_um: f64,
     tolerance_um: f64,
+}
+
+struct Candidate {
+    si: usize,
+    seg: RoutedSegment,
+    len: f64,
+    u: Point,
+    n: Point,
+    s_min: f64,
+    s_max: f64,
+    c: f64,
+}
+
+struct ClearCtx<'a> {
+    board: &'a Board,
+    index: &'a RouteSpatialIndex,
+    qbuf: &'a mut Vec<usize>,
+    sbuf: &'a mut Vec<usize>,
+    clr: f64,
+    refine_eps: f64,
+}
+
+fn tune_single_net(
+    board: &Board,
+    nr: &mut NetRoute,
+    spec: TuneTarget,
     index: &mut RouteSpatialIndex,
     qbuf: &mut Vec<usize>,
     sbuf: &mut Vec<usize>,
+    is_cancelled: &dyn Fn() -> bool,
 ) -> bool {
     let rules = &board.nets[nr.net_id].rules;
     let clr = rules.clearance;
-    let stop_eps = (tolerance_um * 0.15).clamp(5.0, 40.0);
+    let stop_eps = tune_stop_eps(spec.tolerance_um);
+    let refine_eps = (stop_eps * 0.5).clamp(0.25, 5.0);
     let board_span = (board.bounds.max_x - board.bounds.min_x)
         .max(board.bounds.max_y - board.bounds.min_y)
         .max(2000.0);
@@ -523,147 +771,161 @@ fn tune_single_net(
 
     for &h_cap in &caps {
         while bumps_added < 128 {
-            let cur_len = fixed_len + route_wirelength(nr);
-            let needed = target_um - cur_len;
+            if is_cancelled() {
+                return any_changed;
+            }
+            let cur_len = spec.fixed_len + route_wirelength(nr);
+            let needed = spec.target_um - cur_len;
             if needed <= stop_eps {
                 return any_changed;
             }
 
-            let tapped = find_tapped_segments(board, nr);
-            let mut candidates: Vec<(usize, f64, f64, f64, f64, f64, f64)> = Vec::new();
-            for (si, seg) in nr.segments.iter().enumerate() {
-                if tapped[si] || !is_octilinear(seg.a, seg.b) {
-                    continue;
-                }
-                let len = seg.a.dist(seg.b);
-                let c = 0.5 * (seg.width + clr);
-                let top_w = seg.width + clr;
-                let span = 4.0 * c + top_w;
-                let sa = endpoint_standoff(board, nr, seg.layer, seg.a, seg.width, clr);
-                let sb = endpoint_standoff(board, nr, seg.layer, seg.b, seg.width, clr);
-                if len >= span + sa + sb {
-                    candidates.push((si, len, sa, sb, c, top_w, span));
-                }
-            }
-            candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
-
-            let mut placed = false;
-
-            // Fast path: try a single centered exact-length bump on the longest clear segment.
-            for &(si, len, sa, sb, c, top_w, span) in &candidates {
-                let h_req = height_for_delta(needed, c);
-                if h_req > h_cap {
-                    continue;
-                }
-                let seg = nr.segments[si].clone();
-                let u = Point::new((seg.b.x - seg.a.x) / len, (seg.b.y - seg.a.y) / len);
-                let n = Point::new(-u.y, u.x);
-                let mid_s0 = 0.5 * (sa + (len - sb - span));
-                for side in [pref_side, -pref_side] {
-                    let bump = build_bump_segments(
-                        seg.a, u, n, seg.layer, seg.width, mid_s0, c, top_w, h_req, side,
-                    );
-                    if bump_is_clear(board, nr, si, &bump, clr, index, qbuf, sbuf) {
-                        apply_bump(nr, si, &seg, u, mid_s0, span, bump);
-                        index.update_net(route_idx, nr);
-                        any_changed = true;
-                        bumps_added += 1;
-                        pref_side = -side;
-                        placed = true;
-                        break;
-                    }
-                }
-                if placed {
-                    break;
-                }
-            }
-            if placed {
-                continue;
-            }
-
-            // General path: pack DRC-clean bumps along open sub-intervals of eligible segments.
-            let min_useful_delta = needed.min(10.0);
-            for &(si, len, sa, sb, c, top_w, span) in &candidates {
-                let seg = nr.segments[si].clone();
-                let u = Point::new((seg.b.x - seg.a.x) / len, (seg.b.y - seg.a.y) / len);
-                let n = Point::new(-u.y, u.x);
-                let s_min = sa;
-                let s_max = len - sb - span;
-                let step = ((seg.width + clr) * 0.5).max(50.0);
-                let h_hi = height_for_delta(needed, c).min(h_cap);
-                let h_min = (seg.width * 0.2).max(15.0).min(h_hi);
-
-                let mut s0 = s_min;
-                while s0 <= s_max + 1e-6 {
-                    let clamped_s0 = s0.min(s_max);
-                    let mut best_choice: Option<(f64, f64, Vec<RoutedSegment>)> = None;
-                    for side in [pref_side, -pref_side] {
-                        if let Some((h, bump)) = find_max_clear_height(
-                            board, nr, si, &seg, u, n, clamped_s0, c, top_w, h_min, h_hi, side,
-                            clr, index, qbuf, sbuf,
-                        ) {
-                            let d = delta_for_height(h, c);
-                            let better = match best_choice {
-                                None => d >= min_useful_delta,
-                                Some((best_d, _, _)) => d > best_d + 1.0,
-                            };
-                            if better {
-                                best_choice = Some((d, side, bump));
-                            }
-                        }
-                    }
-                    if let Some((_, chosen_side, bump)) = best_choice {
-                        apply_bump(nr, si, &seg, u, clamped_s0, span, bump);
-                        index.update_net(route_idx, nr);
-                        any_changed = true;
-                        bumps_added += 1;
-                        pref_side = -chosen_side;
-                        placed = true;
-                        break;
-                    }
-                    if clamped_s0 >= s_max - 1e-6 {
-                        break;
-                    }
-                    s0 += step;
-                }
-                if placed {
-                    break;
-                }
-            }
-            if !placed {
+            let candidates = collect_candidates(board, nr, clr);
+            let mut ctx = ClearCtx {
+                board,
+                index,
+                qbuf,
+                sbuf,
+                clr,
+                refine_eps,
+            };
+            let Some((ci, s0, chosen_side, bump)) = find_best_bump(
+                &mut ctx,
+                nr,
+                &candidates,
+                needed,
+                h_cap,
+                pref_side,
+                is_cancelled,
+            ) else {
                 break;
-            }
+            };
+            apply_bump(nr, &candidates[ci], s0, bump);
+            index.update_net(spec.route_idx, nr);
+            any_changed = true;
+            bumps_added += 1;
+            pref_side = -chosen_side;
         }
     }
 
     any_changed
 }
 
-#[allow(clippy::too_many_arguments)]
-fn find_max_clear_height(
-    board: &Board,
+fn collect_candidates(board: &Board, nr: &NetRoute, clr: f64) -> Vec<Candidate> {
+    let tapped = find_tapped_segments(board, nr);
+    let mut candidates = Vec::new();
+    for (si, seg) in nr.segments.iter().enumerate() {
+        if tapped[si] || !is_octilinear(seg.a, seg.b) {
+            continue;
+        }
+        let len = seg.a.dist(seg.b);
+        let c = 0.5 * (seg.width + clr);
+        let span = 6.0 * c;
+        let sa = endpoint_standoff(board, nr, seg.layer, seg.a, seg.width, clr);
+        let sb = endpoint_standoff(board, nr, seg.layer, seg.b, seg.width, clr);
+        if len >= span + sa + sb {
+            let u = Point::new((seg.b.x - seg.a.x) / len, (seg.b.y - seg.a.y) / len);
+            let n = Point::new(-u.y, u.x);
+            candidates.push(Candidate {
+                si,
+                seg: seg.clone(),
+                len,
+                u,
+                n,
+                s_min: sa,
+                s_max: len - sb - span,
+                c,
+            });
+        }
+    }
+    candidates.sort_by(|a, b| b.len.partial_cmp(&a.len).unwrap_or(Ordering::Equal));
+    candidates
+}
+
+fn find_best_bump(
+    ctx: &mut ClearCtx<'_>,
     nr: &NetRoute,
-    seg_idx: usize,
-    seg: &RoutedSegment,
-    u: Point,
-    n: Point,
+    candidates: &[Candidate],
+    needed: f64,
+    h_cap: f64,
+    pref_side: f64,
+    is_cancelled: &dyn Fn() -> bool,
+) -> Option<(usize, f64, f64, Vec<RoutedSegment>)> {
+    // Fast path: try a single centered exact-length bump on the longest clear segment.
+    for (ci, cand) in candidates.iter().enumerate() {
+        if is_cancelled() {
+            return None;
+        }
+        let h_req = height_for_delta(needed, cand.c);
+        if h_req > h_cap {
+            continue;
+        }
+        let mid_s0 = 0.5 * (cand.s_min + cand.s_max);
+        for side in [pref_side, -pref_side] {
+            let bump = build_bump_segments(cand, mid_s0, h_req, side);
+            if bump_is_clear(ctx, nr, cand.si, &bump) {
+                return Some((ci, mid_s0, side, bump));
+            }
+        }
+    }
+
+    // General path: pack DRC-clean bumps along open sub-intervals of eligible segments.
+    for (ci, cand) in candidates.iter().enumerate() {
+        let step = ((cand.seg.width + ctx.clr) * 0.5).max(50.0);
+        let h_hi = height_for_delta(needed, cand.c).min(h_cap);
+        let h_min = (cand.seg.width * 0.2)
+            .max(15.0)
+            .min(h_hi * 0.5)
+            .max(MIN_BUMP_H_UM)
+            .min(h_hi);
+        let min_useful_delta = needed.min(10.0).min(delta_for_height(h_min, cand.c));
+
+        let mut s0 = cand.s_min;
+        loop {
+            if is_cancelled() {
+                return None;
+            }
+            let mut best_choice: Option<(f64, f64, Vec<RoutedSegment>)> = None;
+            for side in [pref_side, -pref_side] {
+                if let Some((h, bump)) = find_max_clear_height(ctx, nr, cand, s0, h_min, h_hi, side)
+                {
+                    let d = delta_for_height(h, cand.c);
+                    let better = match best_choice {
+                        None => d >= min_useful_delta,
+                        Some((best_d, _, _)) => d > best_d + 1.0,
+                    };
+                    if better {
+                        best_choice = Some((d, side, bump));
+                    }
+                }
+            }
+            if let Some((_, chosen_side, bump)) = best_choice {
+                return Some((ci, s0, chosen_side, bump));
+            }
+            if s0 >= cand.s_max - 1e-6 {
+                break;
+            }
+            s0 = (s0 + step).min(cand.s_max);
+        }
+    }
+    None
+}
+
+fn find_max_clear_height(
+    ctx: &mut ClearCtx<'_>,
+    nr: &NetRoute,
+    cand: &Candidate,
     s0: f64,
-    c: f64,
-    top_w: f64,
     h_min: f64,
     h_hi: f64,
     side: f64,
-    clr: f64,
-    index: &RouteSpatialIndex,
-    qbuf: &mut Vec<usize>,
-    sbuf: &mut Vec<usize>,
 ) -> Option<(f64, Vec<RoutedSegment>)> {
-    let bump_hi = build_bump_segments(seg.a, u, n, seg.layer, seg.width, s0, c, top_w, h_hi, side);
-    if bump_is_clear(board, nr, seg_idx, &bump_hi, clr, index, qbuf, sbuf) {
+    let bump_hi = build_bump_segments(cand, s0, h_hi, side);
+    if bump_is_clear(ctx, nr, cand.si, &bump_hi) {
         return Some((h_hi, bump_hi));
     }
-    let bump_lo = build_bump_segments(seg.a, u, n, seg.layer, seg.width, s0, c, top_w, h_min, side);
-    if !bump_is_clear(board, nr, seg_idx, &bump_lo, clr, index, qbuf, sbuf) {
+    let bump_lo = build_bump_segments(cand, s0, h_min, side);
+    if !bump_is_clear(ctx, nr, cand.si, &bump_lo) {
         return None;
     }
 
@@ -671,14 +933,14 @@ fn find_max_clear_height(
     let mut hi = h_hi;
     let mut best_bump = bump_lo;
     for _ in 0..12 {
-        if hi - lo <= 5.0 {
+        if hi - lo <= ctx.refine_eps {
             break;
         }
         let mid = 0.5 * (lo + hi);
-        let cand = build_bump_segments(seg.a, u, n, seg.layer, seg.width, s0, c, top_w, mid, side);
-        if bump_is_clear(board, nr, seg_idx, &cand, clr, index, qbuf, sbuf) {
+        let bump = build_bump_segments(cand, s0, mid, side);
+        if bump_is_clear(ctx, nr, cand.si, &bump) {
             lo = mid;
-            best_bump = cand;
+            best_bump = bump;
         } else {
             hi = mid;
         }
@@ -686,27 +948,19 @@ fn find_max_clear_height(
     Some((lo, best_bump))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn build_bump_segments(
-    origin: Point,
-    u: Point,
-    n: Point,
-    layer: usize,
-    width: f64,
-    s0: f64,
-    c: f64,
-    top_w: f64,
-    h: f64,
-    side: f64,
-) -> Vec<RoutedSegment> {
+fn build_bump_segments(cand: &Candidate, s0: f64, h: f64, side: f64) -> Vec<RoutedSegment> {
+    let c = cand.c;
+    let top_w = 2.0 * c;
+    let span = 6.0 * c;
+    let h = h.max(MIN_BUMP_H_UM);
+    let origin = cand.seg.a;
     let pt = |s: f64, y: f64| {
         Point::new(
-            origin.x + u.x * s + n.x * (side * y),
-            origin.y + u.y * s + n.y * (side * y),
+            origin.x + cand.u.x * s + cand.n.x * (side * y),
+            origin.y + cand.u.y * s + cand.n.y * (side * y),
         )
     };
-    let span = 4.0 * c + top_w;
-    let pts: Vec<Point> = if h <= 2.0 * c + 1e-6 {
+    let pts: Vec<Point> = if h <= 2.0 * c + 0.5 {
         vec![
             pt(s0, 0.0),
             pt(s0 + h, h),
@@ -726,36 +980,26 @@ fn build_bump_segments(
         ]
     };
     pts.windows(2)
-        .filter(|w| w[0].dist(w[1]) > 0.1)
         .map(|w| RoutedSegment {
-            layer,
+            layer: cand.seg.layer,
             a: w[0],
             b: w[1],
-            width,
+            width: cand.seg.width,
         })
         .collect()
 }
 
-#[allow(clippy::too_many_arguments)]
 fn bump_is_clear(
-    board: &Board,
+    ctx: &mut ClearCtx<'_>,
     nr: &NetRoute,
     seg_idx: usize,
     bump: &[RoutedSegment],
-    clr: f64,
-    index: &RouteSpatialIndex,
-    qbuf: &mut Vec<usize>,
-    sbuf: &mut Vec<usize>,
 ) -> bool {
+    let board = ctx.board;
     let net_id = nr.net_id;
-    let req_self = clr + 0.5;
+    let req_self = ctx.clr + 0.5;
     for cand in bump {
-        if !board.check_segment_static_with_buf(
-            net_id, cand.layer, cand.a, cand.b, cand.width, 0.5, sbuf,
-        ) {
-            return false;
-        }
-        if !index.clears_segment(board, net_id, cand, qbuf) {
+        if !segment_clear(board, net_id, cand, ctx.index, ctx.qbuf, ctx.sbuf) {
             return false;
         }
         let half_w = cand.width * 0.5;
@@ -786,7 +1030,10 @@ fn bump_is_clear(
                 return false;
             }
         }
-        for fs in &board.fixed_segments {
+        let qbox = BBox::from_points(&[cand.a, cand.b], half_w + req_self + 50.0);
+        board.fixed_seg_index.query(qbox, ctx.sbuf);
+        for &sid in ctx.sbuf.iter() {
+            let fs = &board.fixed_segments[sid];
             if fs.net_id != Some(net_id) || fs.layer != cand.layer {
                 continue;
             }
@@ -795,7 +1042,9 @@ fn bump_is_clear(
                 return false;
             }
         }
-        for fv in &board.fixed_vias {
+        board.fixed_via_index.query(qbox, ctx.sbuf);
+        for &vid in ctx.sbuf.iter() {
+            let fv = &board.fixed_vias[vid];
             if fv.net_id != Some(net_id) || !fv.layers.contains(&cand.layer) {
                 continue;
             }
@@ -807,18 +1056,15 @@ fn bump_is_clear(
     true
 }
 
-fn apply_bump(
-    nr: &mut NetRoute,
-    seg_idx: usize,
-    orig: &RoutedSegment,
-    u: Point,
-    s0: f64,
-    span: f64,
-    bump: Vec<RoutedSegment>,
-) {
-    let p_start = Point::new(orig.a.x + u.x * s0, orig.a.y + u.y * s0);
-    let p_end = Point::new(orig.a.x + u.x * (s0 + span), orig.a.y + u.y * (s0 + span));
-    nr.segments.swap_remove(seg_idx);
+fn apply_bump(nr: &mut NetRoute, cand: &Candidate, s0: f64, bump: Vec<RoutedSegment>) {
+    let orig = &cand.seg;
+    let span = 6.0 * cand.c;
+    let p_start = Point::new(orig.a.x + cand.u.x * s0, orig.a.y + cand.u.y * s0);
+    let p_end = Point::new(
+        orig.a.x + cand.u.x * (s0 + span),
+        orig.a.y + cand.u.y * (s0 + span),
+    );
+    nr.segments.swap_remove(cand.si);
     if orig.a.dist(p_start) > 0.5 {
         nr.segments.push(RoutedSegment {
             layer: orig.layer,
@@ -868,67 +1114,4 @@ fn endpoint_standoff(
         }
     }
     s
-}
-
-/// Identifies segments with an interior T-junction, pad, or via contact.
-fn find_tapped_segments(board: &Board, nr: &NetRoute) -> Vec<bool> {
-    let mut pts_by_layer: HashMap<usize, Vec<Point>> = HashMap::new();
-    for &pid in &board.nets[nr.net_id].pad_ids {
-        let p = &board.pads[pid];
-        for &(l, _) in &p.layer_shapes {
-            pts_by_layer.entry(l).or_default().push(p.center);
-        }
-    }
-    for v in &nr.vias {
-        for &l in &v.layers {
-            pts_by_layer.entry(l).or_default().push(v.pos);
-        }
-    }
-    for fv in &board.fixed_vias {
-        if fv.net_id == Some(nr.net_id) {
-            for &l in &fv.layers {
-                pts_by_layer.entry(l).or_default().push(fv.pos);
-            }
-        }
-    }
-    for fs in &board.fixed_segments {
-        if fs.net_id == Some(nr.net_id) {
-            let list = pts_by_layer.entry(fs.layer).or_default();
-            list.push(fs.a);
-            list.push(fs.b);
-        }
-    }
-    for s in &nr.segments {
-        let list = pts_by_layer.entry(s.layer).or_default();
-        list.push(s.a);
-        list.push(s.b);
-    }
-
-    let mut tapped = vec![false; nr.segments.len()];
-    for (i, s) in nr.segments.iter().enumerate() {
-        let Some(pts) = pts_by_layer.get(&s.layer) else {
-            continue;
-        };
-        let ka = pt_key(s.a);
-        let kb = pt_key(s.b);
-        let tol = s.width * 0.5 + 2.0;
-        let min_x = s.a.x.min(s.b.x) - tol;
-        let max_x = s.a.x.max(s.b.x) + tol;
-        let min_y = s.a.y.min(s.b.y) - tol;
-        let max_y = s.a.y.max(s.b.y) + tol;
-        for &pt in pts {
-            if pt.x < min_x || pt.x > max_x || pt.y < min_y || pt.y > max_y {
-                continue;
-            }
-            let kp = pt_key(pt);
-            if kp == ka || kp == kb {
-                continue;
-            }
-            if point_to_segment_dist(pt, s.a, s.b) <= tol {
-                tapped[i] = true;
-                break;
-            }
-        }
-    }
-    tapped
 }
