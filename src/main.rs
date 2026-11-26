@@ -9,8 +9,9 @@ use std::process::ExitCode;
 use std::sync::Mutex;
 
 use viahop::{
-    Board, DsnDesign, RouteReport, RouteScore, RouterConfig, parse_ses,
-    route_board_with_checkpoint, ses, signal,
+    Board, DsnDesign, LengthConstraints, RouteReport, RouteScore, RouterConfig,
+    parse_match_group_spec, parse_max_length_spec, parse_ses, route_board_with_checkpoint, ses,
+    signal,
 };
 
 struct CliArgs {
@@ -23,6 +24,7 @@ struct CliArgs {
     max_passes: usize,
     multi_start: usize,
     ignored_nets: HashSet<String>,
+    length_constraints: LengthConstraints,
     threads: usize,
     via_at_smd: Option<bool>,
     timeout_secs: Option<u64>,
@@ -74,6 +76,7 @@ fn parse_args(args: &[String]) -> Result<Action, String> {
     let mut max_passes: usize = 20;
     let mut multi_start: usize = 4;
     let mut ignored_nets = HashSet::new();
+    let mut length_constraints = LengthConstraints::default();
     let mut threads: usize = 1;
     let mut via_at_smd: Option<bool> = None;
     let mut timeout_secs: Option<u64> = None;
@@ -127,6 +130,18 @@ fn parse_args(args: &[String]) -> Result<Action, String> {
                     }
                 }
             }
+            "--max-length" => {
+                let v = next_val(&mut i, flag, inline_val)?;
+                length_constraints
+                    .max_lengths
+                    .push(parse_max_length_spec(&v)?);
+            }
+            "--match-group" => {
+                let v = next_val(&mut i, flag, inline_val)?;
+                length_constraints
+                    .match_groups
+                    .push(parse_match_group_spec(&v)?);
+            }
             "-mt" | "--threads" => {
                 let v = next_val(&mut i, flag, inline_val)?;
                 threads = v
@@ -163,6 +178,7 @@ fn parse_args(args: &[String]) -> Result<Action, String> {
         max_passes,
         multi_start,
         ignored_nets,
+        length_constraints,
         threads,
         via_at_smd,
         timeout_secs,
@@ -192,6 +208,7 @@ fn run(cli: CliArgs) -> Result<(), String> {
         None
     };
 
+    let has_length_constraints = !cli.length_constraints.is_empty();
     let config = RouterConfig {
         max_passes: cli.max_passes,
         ignored_nets: cli.ignored_nets,
@@ -201,6 +218,7 @@ fn run(cli: CliArgs) -> Result<(), String> {
         optimize: true,
         multi_start: cli.multi_start,
         initial_routes,
+        length_constraints: cli.length_constraints,
         stop_flag: None,
     };
 
@@ -220,7 +238,13 @@ fn run(cli: CliArgs) -> Result<(), String> {
         .map_err(|e| format!("failed to write {}: {e}", cli.output_ses))?;
 
     if let Some(ref report_path) = cli.report_file {
-        let report = RouteReport::build(&board, &inner.routes, inner.stats.clone(), cli.diagnose);
+        let report = RouteReport::build_with_constraints(
+            &board,
+            &inner.routes,
+            inner.stats.clone(),
+            cli.diagnose,
+            &config.length_constraints,
+        );
         write_atomic(report_path, &report.to_json())
             .map_err(|e| format!("failed to write report {report_path}: {e}"))?;
     }
@@ -230,8 +254,13 @@ fn run(cli: CliArgs) -> Result<(), String> {
         println!("{}", s.to_json());
     } else if !cli.disable_log {
         let stopped = if s.stopped_early { " [stopped]" } else { "" };
+        let len_note = if has_length_constraints {
+            format!(", {} length issues", s.length_violations)
+        } else {
+            String::new()
+        };
         eprintln!(
-            "viahop: routed {}/{} nets ({} unconnected pairs), {} segs, {} vias, {:.1}mm wire, {} passes ({} starts), {} DRC issues, grid={}um, {}ms{stopped}",
+            "viahop: routed {}/{} nets ({} unconnected pairs), {} segs, {} vias, {:.1}mm wire, {} passes ({} starts), {} DRC issues{len_note}, grid={}um, {}ms{stopped}",
             s.routed_nets,
             s.routable_nets,
             s.unconnected_pairs,
@@ -268,6 +297,8 @@ OPTIONS:\n  \
   --report <FILE>              Write detailed JSON report (stats, unrouted, violations)\n  \
   --diagnose                   With --report, classify unrouted pairs (congestion vs blocked)\n  \
   --ignore <LIST>              Comma-separated ignored net classes or nets (alias: -inc)\n  \
+  --max-length <SPEC>          Repeatable max length: NET[+NET2]=LEN (e.g. CLK=22mm, A+B=40mm)\n  \
+  --match-group <SPEC>         Repeatable skew group: NAME:N1,N2,...:TOL[@TARGET] (e.g. QSPI:CLK,D0:0.5mm)\n  \
   --threads <N>                Worker threads, default 1 (alias: -mt)\n  \
   --rules <FILE>               Optional Specctra rules file (alias: -dr)\n  \
   -q, --quiet                  Suppress stderr summary (alias: -dl)\n  \

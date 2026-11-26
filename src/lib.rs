@@ -9,6 +9,7 @@ pub mod fanout;
 pub mod ffi;
 pub mod geometry;
 pub mod grid;
+pub mod length;
 pub mod optimize;
 pub mod report;
 pub mod router;
@@ -20,6 +21,11 @@ pub use board::{Board, NetRoute, RoutedSegment, RoutedVia};
 pub use connectivity::RouteScore;
 pub use drc::{DrcReport, DrcViolation, check_drc};
 pub use dsn::DsnDesign;
+pub use length::{
+    LengthConstraints, LengthReport, LengthViolation, LengthViolationKind, MatchGroupConstraint,
+    MatchGroupMember, MatchGroupResult, MaxLengthConstraint, MaxLengthResult, evaluate_lengths,
+    net_total_length_um, parse_match_group_spec, parse_max_length_spec, tune_match_groups,
+};
 pub use report::{RouteReport, UnroutedConnection, UnroutedKind, ViolationDetail};
 pub use router::{RouteStats, RouterConfig, route_board, route_board_with_checkpoint};
 pub use ses::parse_ses;
@@ -35,7 +41,7 @@ pub struct RouteResult {
 impl RouteStats {
     pub fn to_json(&self) -> String {
         format!(
-            "{{\"total_nets\":{},\"routable_nets\":{},\"routed_nets\":{},\"unconnected_pairs\":{},\"total_segments\":{},\"total_vias\":{},\"total_wirelength_um\":{:.1},\"passes_run\":{},\"starts_run\":{},\"drc_violations\":{},\"dense_bga_pads\":{},\"pofv_capable_pads\":{},\"grid_step_um\":{:.1},\"stopped_early\":{},\"elapsed_ms\":{}}}",
+            "{{\"total_nets\":{},\"routable_nets\":{},\"routed_nets\":{},\"unconnected_pairs\":{},\"total_segments\":{},\"total_vias\":{},\"total_wirelength_um\":{:.1},\"passes_run\":{},\"starts_run\":{},\"drc_violations\":{},\"length_violations\":{},\"dense_bga_pads\":{},\"pofv_capable_pads\":{},\"grid_step_um\":{:.1},\"stopped_early\":{},\"elapsed_ms\":{}}}",
             self.total_nets,
             self.routable_nets,
             self.routed_nets,
@@ -46,6 +52,7 @@ impl RouteStats {
             self.passes_run,
             self.starts_run,
             self.drc_violations,
+            self.length_violations,
             self.dense_bga_pads,
             self.pofv_capable_pads,
             self.grid_step_um,

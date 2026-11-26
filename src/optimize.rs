@@ -7,7 +7,7 @@ use crate::board::{Board, NetRoute, RoutedSegment, RoutedVia, SpatialGrid};
 use crate::geometry::{BBox, Point, point_to_segment_dist, segment_to_segment_dist};
 
 /// Spatial index over all routed segments and vias for fast dynamic clearance checks.
-struct RouteSpatialIndex {
+pub(crate) struct RouteSpatialIndex {
     segs: Vec<Option<(usize, RoutedSegment)>>,
     vias: Vec<Option<(usize, RoutedVia)>>,
     seg_grid: SpatialGrid,
@@ -18,7 +18,7 @@ struct RouteSpatialIndex {
 }
 
 impl RouteSpatialIndex {
-    fn build(board: &Board, routes: &[NetRoute]) -> Self {
+    pub(crate) fn build(board: &Board, routes: &[NetRoute]) -> Self {
         let max_board_clr = board
             .nets
             .iter()
@@ -56,7 +56,7 @@ impl RouteSpatialIndex {
         }
     }
 
-    fn update_net(&mut self, net_idx: usize, nr: &NetRoute) {
+    pub(crate) fn update_net(&mut self, net_idx: usize, nr: &NetRoute) {
         for slot in self.net_seg_slots[net_idx].drain(..) {
             self.segs[slot] = None;
         }
@@ -66,7 +66,7 @@ impl RouteSpatialIndex {
         self.insert_net(net_idx, nr);
     }
 
-    fn clears_segment(
+    pub(crate) fn clears_segment(
         &self,
         board: &Board,
         net_id: usize,
@@ -162,7 +162,7 @@ pub fn route_wirelength(nr: &NetRoute) -> f64 {
 }
 
 #[inline]
-fn pt_key(p: Point) -> (i64, i64) {
+pub(crate) fn pt_key(p: Point) -> (i64, i64) {
     ((p.x * 10.0).round() as i64, (p.y * 10.0).round() as i64)
 }
 
@@ -754,7 +754,7 @@ fn is_collinear(a: Point, b: Point, c: Point) -> bool {
     (ux * vy - uy * vx).abs() < 1e-2 && (ux * vx + uy * vy) > 0.0
 }
 
-fn is_octilinear(a: Point, b: Point) -> bool {
+pub(crate) fn is_octilinear(a: Point, b: Point) -> bool {
     let dx = (b.x - a.x).abs();
     let dy = (b.y - a.y).abs();
     dx < 1.0 || dy < 1.0 || (dx - dy).abs() < 1.0

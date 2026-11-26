@@ -586,6 +586,7 @@ fn report_and_diagnose_distinguishes_blocked_vs_congestion() {
         passes_run: 0,
         starts_run: 1,
         drc_violations: 0,
+        length_violations: 0,
         dense_bga_pads: 0,
         pofv_capable_pads: 0,
         grid_step_um: 50.0,
