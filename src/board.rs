@@ -89,6 +89,35 @@ pub struct FixedSegment {
     pub half_w: f64,
     pub net_id: Option<usize>,
     pub bbox: BBox,
+    pub is_synthetic: bool,
+    pub wire_group: Option<usize>,
+}
+
+/// Exact static obstacle identified when a continuous DRC check fails.
+#[derive(Debug, Clone)]
+pub struct StaticBlocker {
+    pub label: String,
+    pub net_b: Option<usize>,
+    pub gap_um: f64,
+    pub required_um: f64,
+}
+
+#[derive(Clone, Copy)]
+enum StaticObstacle {
+    Boundary,
+    Keepout(bool),
+    Pad(usize),
+    FixedVia(usize),
+    FixedWire(usize),
+    FixedPlane(usize),
+}
+
+#[derive(Clone, Copy)]
+struct StaticHit {
+    obstacle: StaticObstacle,
+    deficit: f64,
+    gap_um: f64,
+    required_um: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -240,12 +269,12 @@ pub struct Board {
     pub via_at_smd: bool,
     pub hole_to_hole_um: f64,
     pub edge_clearance_um: Option<f64>,
+    pub max_net_clearance: f64,
     pub pad_index: SpatialGrid,
     pub keepout_index: SpatialGrid,
     pub fixed_seg_index: SpatialGrid,
     pub fixed_via_index: SpatialGrid,
     pub fixed_plane_index: SpatialGrid,
-    pub(crate) max_net_clearance: f64,
 }
 
 impl Board {
@@ -459,6 +488,8 @@ impl Board {
                             half_w,
                             net_id: None,
                             bbox: BBox::from_points(&[a, b], half_w),
+                            is_synthetic: true,
+                            wire_group: None,
                         });
                     }
                 }
@@ -466,7 +497,7 @@ impl Board {
         }
 
         // Resolve fixed/protected existing wires and vias.
-        for w in &design.existing_wires {
+        for (wire_idx, w) in design.existing_wires.iter().enumerate() {
             if w.wire_type == WireType::Route {
                 continue;
             }
@@ -483,6 +514,8 @@ impl Board {
                     half_w,
                     net_id,
                     bbox: BBox::from_points(&[seg[0], seg[1]], half_w),
+                    is_synthetic: false,
+                    wire_group: Some(wire_idx),
                 });
             }
         }
@@ -598,18 +631,14 @@ impl Board {
             }
         }
 
-        let max_net_clearance = nets
-            .iter()
-            .map(|n| {
-                n.rules
-                    .clearance
-                    .max(n.rules.via_wire)
-                    .max(n.rules.via_via)
-                    .max(n.rules.via_smd)
-            })
-            .fold(0.0_f64, f64::max);
-
         let via_at_smd = force_via_at_smd.unwrap_or(design.via_at_smd);
+        let max_net_clearance = nets.iter().fold(100.0_f64, |acc, n| {
+            let r = &n.rules;
+            acc.max(r.clearance)
+                .max(r.via_wire)
+                .max(r.via_via)
+                .max(r.via_smd)
+        });
 
         Ok(Self {
             layer_names,
@@ -627,12 +656,12 @@ impl Board {
             via_at_smd,
             hole_to_hole_um,
             edge_clearance_um,
+            max_net_clearance,
             pad_index,
             keepout_index,
             fixed_seg_index,
             fixed_via_index,
             fixed_plane_index,
-            max_net_clearance,
         })
     }
 
@@ -697,107 +726,18 @@ impl Board {
         margin_extra: f64,
         buf: &mut Vec<usize>,
     ) -> bool {
-        let edge_clr = self.edge_clearance_um.unwrap_or(0.0);
-        if !self.is_inside_boundary(pos, radius + edge_clr + margin_extra) {
-            return false;
-        }
-        let max_clr = self.max_net_clearance + margin_extra.max(0.0);
-        let qbox = BBox::from_point(pos, radius + max_clr + 50.0);
-        let cutout_margin = self.edge_clearance_um.unwrap_or(145.0).max(145.0);
-
-        // Keepouts (structure cutouts honor edge clearance, at least 145um for curved Edge.Cuts).
-        self.keepout_index
-            .query(qbox.expand(cutout_margin + 15.0), buf);
-        for &kid in buf.iter() {
-            let k = &self.keepouts[kid];
-            if k.kind == KeepoutKind::Wire || !layers.iter().any(|&l| k.applies_to_layer(l)) {
-                continue;
-            }
-            let k_margin = if k.is_structure && k.kind == KeepoutKind::All {
-                cutout_margin
-            } else {
-                5.0
-            };
-            if k.shape.dist_to_circle(pos, radius) < k_margin + margin_extra - 1e-4 {
-                return false;
-            }
-        }
-
-        // Other-net pads
-        self.pad_index.query(qbox, buf);
-        for &pid in buf.iter() {
-            let pad = &self.pads[pid];
-            if pad.net_id == Some(net_id) {
-                continue;
-            }
-            let req = self.via_to_pad_clearance(net_id, pad) + margin_extra;
-            for &(l, ref sh) in &pad.layer_shapes {
-                if !layers.contains(&l) {
-                    continue;
-                }
-                if sh.dist_to_circle(pos, radius) < req - 1e-4 {
-                    return false;
-                }
-            }
-        }
-
-        // Fixed vias (check both other-net copper clearance and same-net drill hole-to-hole).
-        let hole_qbox = qbox.union(BBox::from_point(
+        self.scan_via_static::<true>(
+            Some(net_id),
             pos,
-            drill * 0.5 + self.hole_to_hole_um + margin_extra.max(0.0) + 120.0,
-        ));
-        self.fixed_via_index.query(hole_qbox, buf);
-        for &vid in buf.iter() {
-            let fv = &self.fixed_vias[vid];
-            let center_dist = pos.dist(fv.pos);
-            let min_hole_c2c = (drill + fv.drill) * 0.5 + self.hole_to_hole_um + margin_extra;
-            if fv.net_id == Some(net_id) {
-                if center_dist >= 5.0 && center_dist < min_hole_c2c - 1e-4 {
-                    return false;
-                }
-                continue;
-            }
-            if !fv.layers.iter().any(|l| layers.contains(l)) {
-                continue;
-            }
-            let req = self.via_to_via_clearance(net_id, fv.net_id) + margin_extra;
-            if center_dist - radius - fv.radius < req - 1e-4 || center_dist < min_hole_c2c - 1e-4 {
-                return false;
-            }
-        }
-
-        // Fixed wires
-        self.fixed_seg_index.query(qbox, buf);
-        for &sid in buf.iter() {
-            let fs = &self.fixed_segments[sid];
-            if fs.net_id == Some(net_id) || !layers.contains(&fs.layer) {
-                continue;
-            }
-            let req = self.via_to_wire_clearance(net_id, fs.net_id) + margin_extra;
-            let sh = Shape::Capsule {
-                a: fs.a,
-                b: fs.b,
-                radius: fs.half_w,
-            };
-            if sh.dist_to_circle(pos, radius) < req - 1e-4 {
-                return false;
-            }
-        }
-
-        // Signal-layer planes (other-net vias spanning the plane layer must clear it).
-        self.fixed_plane_index.query(qbox, buf);
-        for &pid in buf.iter() {
-            let fp = &self.planes[pid];
-            if fp.net_id == Some(net_id) || !layers.contains(&fp.layer) {
-                continue;
-            }
-            let req = self.via_to_wire_clearance(net_id, fp.net_id) + margin_extra;
-            if fp.shape.dist_to_circle(pos, radius) < req - 1e-4 {
-                return false;
-            }
-        }
-
-        true
+            radius,
+            drill,
+            layers,
+            margin_extra,
+            None,
+            true,
+            buf,
+        )
+        .is_none()
     }
 
     /// Checks whether a trace segment on `layer` for `net_id` clears all static obstacles.
@@ -826,30 +766,437 @@ impl Board {
         margin_extra: f64,
         buf: &mut Vec<usize>,
     ) -> bool {
-        let half_w = width * 0.5;
+        self.scan_segment_static::<true>(Some(net_id), layer, a, b, width, margin_extra, None, buf)
+            .is_none()
+    }
+
+    /// Returns the worst static obstacle blocking a via for `net_id` at `pos`, if any.
+    pub fn diagnose_via_static(
+        &self,
+        net_id: usize,
+        pos: Point,
+        margin_extra: f64,
+    ) -> Option<StaticBlocker> {
+        let mut buf = Vec::new();
+        self.diagnose_via_static_with_buf(net_id, pos, margin_extra, &mut buf)
+    }
+
+    /// Buffer-reusing variant of `diagnose_via_static` (zero allocation when clean).
+    pub fn diagnose_via_static_with_buf(
+        &self,
+        net_id: usize,
+        pos: Point,
+        margin_extra: f64,
+        buf: &mut Vec<usize>,
+    ) -> Option<StaticBlocker> {
+        let rules = &self.nets[net_id].rules;
+        self.diagnose_routed_via_static_with_buf(
+            net_id,
+            pos,
+            rules.via_radius,
+            rules.via_drill,
+            &rules.via_layers,
+            margin_extra,
+            buf,
+        )
+    }
+
+    /// Diagnoses static obstacles blocking a via with explicit padstack geometry.
+    #[allow(clippy::too_many_arguments)]
+    pub fn diagnose_routed_via_static_with_buf(
+        &self,
+        net_id: usize,
+        pos: Point,
+        radius: f64,
+        drill: f64,
+        layers: &[usize],
+        margin_extra: f64,
+        buf: &mut Vec<usize>,
+    ) -> Option<StaticBlocker> {
+        self.scan_via_static::<false>(
+            Some(net_id),
+            pos,
+            radius,
+            drill,
+            layers,
+            margin_extra,
+            None,
+            true,
+            buf,
+        )
+        .map(|h| self.format_hit(h))
+    }
+
+    /// Returns the worst static obstacle blocking a segment on `layer` for `net_id`, if any.
+    pub fn diagnose_segment_static(
+        &self,
+        net_id: usize,
+        layer: usize,
+        a: Point,
+        b: Point,
+        width: f64,
+        margin_extra: f64,
+    ) -> Option<StaticBlocker> {
+        let mut buf = Vec::new();
+        self.diagnose_segment_static_with_buf(net_id, layer, a, b, width, margin_extra, &mut buf)
+    }
+
+    /// Buffer-reusing variant of `diagnose_segment_static` (zero allocation when clean).
+    #[allow(clippy::too_many_arguments)]
+    pub fn diagnose_segment_static_with_buf(
+        &self,
+        net_id: usize,
+        layer: usize,
+        a: Point,
+        b: Point,
+        width: f64,
+        margin_extra: f64,
+        buf: &mut Vec<usize>,
+    ) -> Option<StaticBlocker> {
+        self.scan_segment_static::<false>(Some(net_id), layer, a, b, width, margin_extra, None, buf)
+            .map(|h| self.format_hit(h))
+    }
+
+    /// Diagnoses static obstacles colliding with pre-existing `fixed_vias[vid]`.
+    pub(crate) fn diagnose_fixed_via_static(
+        &self,
+        vid: usize,
+        margin_extra: f64,
+        buf: &mut Vec<usize>,
+    ) -> Option<StaticBlocker> {
+        let fv = &self.fixed_vias[vid];
+        self.scan_via_static::<false>(
+            fv.net_id,
+            fv.pos,
+            fv.radius,
+            fv.drill,
+            &fv.layers,
+            margin_extra,
+            Some(vid),
+            false,
+            buf,
+        )
+        .map(|h| self.format_hit(h))
+    }
+
+    /// Diagnoses static obstacles colliding with pre-existing `fixed_segments[sid]`.
+    pub(crate) fn diagnose_fixed_segment_static(
+        &self,
+        sid: usize,
+        margin_extra: f64,
+        buf: &mut Vec<usize>,
+    ) -> Option<StaticBlocker> {
+        let fs = &self.fixed_segments[sid];
+        self.scan_segment_static::<false>(
+            fs.net_id,
+            fs.layer,
+            fs.a,
+            fs.b,
+            fs.half_w * 2.0,
+            margin_extra,
+            Some(sid),
+            buf,
+        )
+        .map(|h| self.format_hit(h))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn scan_via_static<const FIRST_ONLY: bool>(
+        &self,
+        net_id: Option<usize>,
+        pos: Point,
+        r: f64,
+        drill: f64,
+        via_layers: &[usize],
+        margin_extra: f64,
+        skip_fixed_via: Option<usize>,
+        check_fixed_segs: bool,
+        buf: &mut Vec<usize>,
+    ) -> Option<StaticHit> {
+        let extra_pos = margin_extra.max(0.0);
+        let edge_clr = self.edge_clearance_um.unwrap_or(0.0);
         if self.boundary.len() >= 3 {
-            if !point_in_polygon(a, &self.boundary) || !point_in_polygon(b, &self.boundary) {
-                return false;
+            let inside = point_in_polygon(pos, &self.boundary);
+            if !inside {
+                let gap = if FIRST_ONLY {
+                    0.0
+                } else {
+                    -point_to_polygon_edge_dist(pos, &self.boundary) - r
+                };
+                return Some(StaticHit {
+                    obstacle: StaticObstacle::Boundary,
+                    deficit: edge_clr + extra_pos - gap,
+                    gap_um: gap,
+                    required_um: edge_clr + extra_pos,
+                });
             }
-            let edge_clr = self.edge_clearance_um.unwrap_or(0.0);
-            let edge_req = half_w + edge_clr + margin_extra;
-            let edge_d = segment_to_polygon_edge_dist(a, b, &self.boundary);
-            if edge_d < edge_req - 1e-4 {
-                if edge_d < half_w + margin_extra - 1e-4 {
-                    return false;
-                }
-                if !self
-                    .segment_edge_pad_exit(net_id, layer, a, b, half_w, edge_clr, edge_d, edge_req)
-                {
-                    return false;
+            let req = r + edge_clr + margin_extra;
+            if req > 0.0 {
+                let edge_d = point_to_polygon_edge_dist(pos, &self.boundary);
+                if edge_d < req - 1e-4 {
+                    return Some(StaticHit {
+                        obstacle: StaticObstacle::Boundary,
+                        deficit: req - edge_d,
+                        gap_um: edge_d - r,
+                        required_um: edge_clr + extra_pos,
+                    });
                 }
             }
         }
-        let max_clr = self.max_net_clearance + margin_extra.max(0.0);
+
+        let is_fixed = skip_fixed_via.is_some();
+        let hole_min = self.hole_to_hole_um;
+        let max_clr = self.max_net_clearance + extra_pos;
+        let qbox = BBox::from_point(pos, r + max_clr + 50.0);
+        let cutout_margin = self.edge_clearance_um.unwrap_or(145.0).max(145.0);
+        let mut worst: Option<StaticHit> = None;
+
+        // Keepouts (structure cutouts honor edge clearance for newly routed copper only).
+        self.keepout_index
+            .query(qbox.expand(cutout_margin + 15.0), buf);
+        for &kid in buf.iter() {
+            let k = &self.keepouts[kid];
+            if k.kind == KeepoutKind::Wire {
+                continue;
+            }
+            if !via_layers.iter().any(|&l| k.applies_to_layer(l)) {
+                continue;
+            }
+            let k_margin = if is_fixed {
+                0.0
+            } else if k.is_structure && k.kind == KeepoutKind::All {
+                cutout_margin
+            } else {
+                5.0
+            };
+            let gap = k.shape.dist_to_circle(pos, r);
+            let req = k_margin + margin_extra;
+            if gap < req - 1e-4 {
+                let hit = StaticHit {
+                    obstacle: StaticObstacle::Keepout(k.is_structure),
+                    deficit: req - gap,
+                    gap_um: gap,
+                    required_um: k_margin + extra_pos,
+                };
+                if FIRST_ONLY {
+                    return Some(hit);
+                }
+                record_hit(&mut worst, hit);
+            }
+        }
+
+        // Other-net pads.
+        self.pad_index.query(qbox, buf);
+        for &pid in buf.iter() {
+            let pad = &self.pads[pid];
+            if same_net(net_id, pad.net_id) {
+                continue;
+            }
+            let base_req = self.pair_clearance(net_id, pad.net_id, |nr| {
+                if pad.is_smd { nr.via_smd } else { nr.via_via }
+            });
+            let req = base_req + margin_extra;
+            for &(l, ref sh) in &pad.layer_shapes {
+                if !via_layers.contains(&l) {
+                    continue;
+                }
+                if is_fixed
+                    && net_id.is_none()
+                    && pad.net_id.is_none()
+                    && sh.dist_to_circle(pos, 0.0) <= 1.0
+                {
+                    continue;
+                }
+                let gap = sh.dist_to_circle(pos, r);
+                if gap < req - 1e-4 {
+                    let hit = StaticHit {
+                        obstacle: StaticObstacle::Pad(pid),
+                        deficit: req - gap,
+                        gap_um: gap,
+                        required_um: base_req + extra_pos,
+                    };
+                    if FIRST_ONLY {
+                        return Some(hit);
+                    }
+                    record_hit(&mut worst, hit);
+                }
+            }
+        }
+
+        // Fixed vias (other-net copper clearance and shared-layer drill hole-to-hole).
+        let fv_reach = (r + max_clr).max(drill * 0.5 + hole_min + extra_pos + 10.0) + 50.0;
+        self.fixed_via_index
+            .query(BBox::from_point(pos, fv_reach), buf);
+        for &vid in buf.iter() {
+            if let Some(self_vid) = skip_fixed_via
+                && vid <= self_vid
+            {
+                continue;
+            }
+            let fv = &self.fixed_vias[vid];
+            if !fv.layers.iter().any(|l| via_layers.contains(l)) {
+                continue;
+            }
+            let center_dist = pos.dist(fv.pos);
+            let hole_gap = center_dist - (drill + fv.drill) * 0.5;
+            let hole_req = hole_min + margin_extra;
+            if same_net(net_id, fv.net_id) {
+                if center_dist >= 5.0 && hole_gap < hole_req - 1e-4 {
+                    let hit = StaticHit {
+                        obstacle: StaticObstacle::FixedVia(vid),
+                        deficit: hole_req - hole_gap,
+                        gap_um: hole_gap,
+                        required_um: hole_min + extra_pos,
+                    };
+                    if FIRST_ONLY {
+                        return Some(hit);
+                    }
+                    record_hit(&mut worst, hit);
+                }
+                continue;
+            }
+            let base_req = self.pair_clearance(net_id, fv.net_id, |nr| nr.via_via);
+            let req = base_req + margin_extra;
+            let copper_gap = center_dist - r - fv.radius;
+            if copper_gap < req - 1e-4 || hole_gap < hole_req - 1e-4 {
+                let c_def = req - copper_gap;
+                let h_def = hole_req - hole_gap;
+                let (deficit, gap_um, required_um) = if c_def >= h_def {
+                    (c_def, copper_gap, base_req + extra_pos)
+                } else {
+                    (h_def, hole_gap, hole_min + extra_pos)
+                };
+                let hit = StaticHit {
+                    obstacle: StaticObstacle::FixedVia(vid),
+                    deficit,
+                    gap_um,
+                    required_um,
+                };
+                if FIRST_ONLY {
+                    return Some(hit);
+                }
+                record_hit(&mut worst, hit);
+            }
+        }
+
+        // Fixed wires.
+        if check_fixed_segs {
+            self.fixed_seg_index.query(qbox, buf);
+            for &sid in buf.iter() {
+                let fs = &self.fixed_segments[sid];
+                if same_net(net_id, fs.net_id) || !via_layers.contains(&fs.layer) {
+                    continue;
+                }
+                let base_req = self.pair_clearance(net_id, fs.net_id, |nr| nr.via_wire);
+                let req = base_req + margin_extra;
+                let sh = Shape::Capsule {
+                    a: fs.a,
+                    b: fs.b,
+                    radius: fs.half_w,
+                };
+                let gap = sh.dist_to_circle(pos, r);
+                if gap < req - 1e-4 {
+                    let hit = StaticHit {
+                        obstacle: StaticObstacle::FixedWire(sid),
+                        deficit: req - gap,
+                        gap_um: gap,
+                        required_um: base_req + extra_pos,
+                    };
+                    if FIRST_ONLY {
+                        return Some(hit);
+                    }
+                    record_hit(&mut worst, hit);
+                }
+            }
+        }
+
+        // Signal-layer planes (other-net vias spanning the plane layer must clear it).
+        self.fixed_plane_index.query(qbox, buf);
+        for &pid in buf.iter() {
+            let fp = &self.planes[pid];
+            if same_net(net_id, fp.net_id) || !via_layers.contains(&fp.layer) {
+                continue;
+            }
+            let base_req = self.pair_clearance(net_id, fp.net_id, |nr| nr.via_wire);
+            let req = base_req + margin_extra;
+            let gap = fp.shape.dist_to_circle(pos, r);
+            if gap < req - 1e-4 {
+                let hit = StaticHit {
+                    obstacle: StaticObstacle::FixedPlane(pid),
+                    deficit: req - gap,
+                    gap_um: gap,
+                    required_um: base_req + extra_pos,
+                };
+                if FIRST_ONLY {
+                    return Some(hit);
+                }
+                record_hit(&mut worst, hit);
+            }
+        }
+
+        worst
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn scan_segment_static<const FIRST_ONLY: bool>(
+        &self,
+        net_id: Option<usize>,
+        layer: usize,
+        a: Point,
+        b: Point,
+        width: f64,
+        margin_extra: f64,
+        skip_fixed_seg: Option<usize>,
+        buf: &mut Vec<usize>,
+    ) -> Option<StaticHit> {
+        let half_w = width * 0.5;
+        let extra_pos = margin_extra.max(0.0);
+        let edge_clr = self.edge_clearance_um.unwrap_or(0.0);
+        if self.boundary.len() >= 3 {
+            let a_in = point_in_polygon(a, &self.boundary);
+            let b_in = point_in_polygon(b, &self.boundary);
+            if !a_in || !b_in {
+                let gap = if FIRST_ONLY {
+                    0.0
+                } else {
+                    let da = point_to_polygon_edge_dist(a, &self.boundary);
+                    let db = point_to_polygon_edge_dist(b, &self.boundary);
+                    (if a_in { da } else { -da }).min(if b_in { db } else { -db }) - half_w
+                };
+                return Some(StaticHit {
+                    obstacle: StaticObstacle::Boundary,
+                    deficit: edge_clr + extra_pos - gap,
+                    gap_um: gap,
+                    required_um: edge_clr + extra_pos,
+                });
+            }
+            let edge_req = half_w + edge_clr + margin_extra;
+            let edge_d = segment_to_polygon_edge_dist(a, b, &self.boundary);
+            if edge_d < edge_req - 1e-4 {
+                let pad_exit_ok = edge_d >= half_w + margin_extra - 1e-4
+                    && net_id.is_some_and(|nid| {
+                        self.segment_edge_pad_exit(
+                            nid, layer, a, b, half_w, edge_clr, edge_d, edge_req,
+                        )
+                    });
+                if !pad_exit_ok {
+                    return Some(StaticHit {
+                        obstacle: StaticObstacle::Boundary,
+                        deficit: edge_req - edge_d,
+                        gap_um: edge_d - half_w,
+                        required_um: edge_clr + extra_pos,
+                    });
+                }
+            }
+        }
+
+        let is_fixed = skip_fixed_seg.is_some();
+        let max_clr = self.max_net_clearance + extra_pos;
         let qbox = BBox::from_points(&[a, b], half_w + max_clr + 50.0);
         let cutout_margin = self.edge_clearance_um.unwrap_or(145.0).max(145.0);
+        let mut worst: Option<StaticHit> = None;
 
-        // Keepouts (structure cutouts honor edge clearance, at least 145um for curved Edge.Cuts).
+        // Keepouts (structure cutouts honor edge clearance for newly routed copper only).
         self.keepout_index
             .query(qbox.expand(cutout_margin + 15.0), buf);
         for &kid in buf.iter() {
@@ -857,59 +1204,138 @@ impl Board {
             if k.kind == KeepoutKind::Via || !k.applies_to_layer(layer) {
                 continue;
             }
-            let k_margin = if k.is_structure && k.kind == KeepoutKind::All {
+            let k_margin = if is_fixed {
+                0.0
+            } else if k.is_structure && k.kind == KeepoutKind::All {
                 cutout_margin
             } else {
                 5.0
             };
-            if k.shape.dist_to_capsule(a, b, half_w) < k_margin + margin_extra - 1e-4 {
-                return false;
+            let gap = k.shape.dist_to_capsule(a, b, half_w);
+            let req = k_margin + margin_extra;
+            if gap < req - 1e-4 {
+                let hit = StaticHit {
+                    obstacle: StaticObstacle::Keepout(k.is_structure),
+                    deficit: req - gap,
+                    gap_um: gap,
+                    required_um: k_margin + extra_pos,
+                };
+                if FIRST_ONLY {
+                    return Some(hit);
+                }
+                record_hit(&mut worst, hit);
             }
         }
 
-        // Other-net pads
+        // Other-net pads.
         self.pad_index.query(qbox, buf);
         for &pid in buf.iter() {
             let pad = &self.pads[pid];
-            if pad.net_id == Some(net_id) {
+            if same_net(net_id, pad.net_id) {
                 continue;
             }
-            let req = self.wire_to_other_clearance(net_id, pad.net_id) + margin_extra;
-            if let Some(sh) = pad.shape_on_layer(layer)
-                && sh.dist_to_capsule(a, b, half_w) < req - 1e-4
-            {
-                return false;
+            let base_req = self.pair_clearance(net_id, pad.net_id, |nr| nr.clearance);
+            let req = base_req + margin_extra;
+            if let Some(sh) = pad.shape_on_layer(layer) {
+                if is_fixed
+                    && net_id.is_none()
+                    && pad.net_id.is_none()
+                    && (sh.dist_to_circle(a, 0.0) <= 1.0 || sh.dist_to_circle(b, 0.0) <= 1.0)
+                {
+                    continue;
+                }
+                let gap = sh.dist_to_capsule(a, b, half_w);
+                if gap < req - 1e-4 {
+                    let hit = StaticHit {
+                        obstacle: StaticObstacle::Pad(pid),
+                        deficit: req - gap,
+                        gap_um: gap,
+                        required_um: base_req + extra_pos,
+                    };
+                    if FIRST_ONLY {
+                        return Some(hit);
+                    }
+                    record_hit(&mut worst, hit);
+                }
             }
         }
 
-        // Fixed vias
+        // Fixed vias.
         self.fixed_via_index.query(qbox, buf);
         for &vid in buf.iter() {
             let fv = &self.fixed_vias[vid];
-            if fv.net_id == Some(net_id) || !fv.layers.contains(&layer) {
+            if same_net(net_id, fv.net_id) || !fv.layers.contains(&layer) {
                 continue;
             }
-            let req = self.via_to_wire_clearance(net_id, fv.net_id) + margin_extra;
             let sh = Shape::Circle {
                 center: fv.pos,
                 radius: fv.radius,
             };
-            if sh.dist_to_capsule(a, b, half_w) < req - 1e-4 {
-                return false;
+            if is_fixed
+                && net_id.is_none()
+                && fv.net_id.is_none()
+                && (sh.dist_to_circle(a, 0.0) <= 1.0 || sh.dist_to_circle(b, 0.0) <= 1.0)
+            {
+                continue;
+            }
+            let base_req = self.pair_clearance(net_id, fv.net_id, |nr| nr.via_wire);
+            let req = base_req + margin_extra;
+            let gap = sh.dist_to_capsule(a, b, half_w);
+            if gap < req - 1e-4 {
+                let hit = StaticHit {
+                    obstacle: StaticObstacle::FixedVia(vid),
+                    deficit: req - gap,
+                    gap_um: gap,
+                    required_um: base_req + extra_pos,
+                };
+                if FIRST_ONLY {
+                    return Some(hit);
+                }
+                record_hit(&mut worst, hit);
             }
         }
 
-        // Fixed wires
+        // Fixed wires.
+        let self_wg = skip_fixed_seg.and_then(|s| self.fixed_segments[s].wire_group);
         self.fixed_seg_index.query(qbox, buf);
         for &sid in buf.iter() {
+            if let Some(self_sid) = skip_fixed_seg {
+                if sid <= self_sid {
+                    continue;
+                }
+                let fs = &self.fixed_segments[sid];
+                if fs.is_synthetic || (self_wg.is_some() && self_wg == fs.wire_group) {
+                    continue;
+                }
+            }
             let fs = &self.fixed_segments[sid];
-            if fs.net_id == Some(net_id) || fs.layer != layer {
+            if same_net(net_id, fs.net_id) || fs.layer != layer {
                 continue;
             }
-            let req = self.wire_to_other_clearance(net_id, fs.net_id) + margin_extra;
+            if is_fixed
+                && net_id.is_none()
+                && fs.net_id.is_none()
+                && (a.dist(fs.a) <= 1.0
+                    || a.dist(fs.b) <= 1.0
+                    || b.dist(fs.a) <= 1.0
+                    || b.dist(fs.b) <= 1.0)
+            {
+                continue;
+            }
+            let base_req = self.pair_clearance(net_id, fs.net_id, |nr| nr.clearance);
+            let req = base_req + margin_extra;
             let gap = segment_to_segment_dist(a, b, fs.a, fs.b) - half_w - fs.half_w;
             if gap < req - 1e-4 {
-                return false;
+                let hit = StaticHit {
+                    obstacle: StaticObstacle::FixedWire(sid),
+                    deficit: req - gap,
+                    gap_um: gap,
+                    required_um: base_req + extra_pos,
+                };
+                if FIRST_ONLY {
+                    return Some(hit);
+                }
+                record_hit(&mut worst, hit);
             }
         }
 
@@ -917,16 +1343,83 @@ impl Board {
         self.fixed_plane_index.query(qbox, buf);
         for &pid in buf.iter() {
             let fp = &self.planes[pid];
-            if fp.net_id == Some(net_id) || fp.layer != layer {
+            if same_net(net_id, fp.net_id) || fp.layer != layer {
                 continue;
             }
-            let req = self.wire_to_other_clearance(net_id, fp.net_id) + margin_extra;
-            if fp.shape.dist_to_capsule(a, b, half_w) < req - 1e-4 {
-                return false;
+            let base_req = self.pair_clearance(net_id, fp.net_id, |nr| nr.clearance);
+            let req = base_req + margin_extra;
+            let gap = fp.shape.dist_to_capsule(a, b, half_w);
+            if gap < req - 1e-4 {
+                let hit = StaticHit {
+                    obstacle: StaticObstacle::FixedPlane(pid),
+                    deficit: req - gap,
+                    gap_um: gap,
+                    required_um: base_req + extra_pos,
+                };
+                if FIRST_ONLY {
+                    return Some(hit);
+                }
+                record_hit(&mut worst, hit);
             }
         }
 
-        true
+        worst
+    }
+
+    fn format_hit(&self, hit: StaticHit) -> StaticBlocker {
+        let (label, net_b) = match hit.obstacle {
+            StaticObstacle::Boundary => ("board_boundary".to_string(), None),
+            StaticObstacle::Keepout(true) => ("keepout (structure)".to_string(), None),
+            StaticObstacle::Keepout(false) => ("keepout (image)".to_string(), None),
+            StaticObstacle::Pad(pid) => {
+                let pad = &self.pads[pid];
+                (
+                    format!(
+                        "pad {}-{} ({})",
+                        pad.refdes,
+                        pad.pin_name,
+                        self.net_label(pad.net_id)
+                    ),
+                    pad.net_id,
+                )
+            }
+            StaticObstacle::FixedVia(vid) => {
+                let net = self.fixed_vias[vid].net_id;
+                (format!("fixed_via ({})", self.net_label(net)), net)
+            }
+            StaticObstacle::FixedWire(sid) => {
+                let net = self.fixed_segments[sid].net_id;
+                (format!("fixed_wire ({})", self.net_label(net)), net)
+            }
+            StaticObstacle::FixedPlane(pid) => {
+                let net = self.planes[pid].net_id;
+                (format!("plane ({})", self.net_label(net)), net)
+            }
+        };
+        StaticBlocker {
+            label,
+            net_b,
+            gap_um: hit.gap_um,
+            required_um: hit.required_um,
+        }
+    }
+
+    fn net_label(&self, net_id: Option<usize>) -> &str {
+        net_id.map_or("no-net", |id| self.nets[id].name.as_str())
+    }
+
+    fn pair_clearance(
+        &self,
+        net_a: Option<usize>,
+        net_b: Option<usize>,
+        field: impl Fn(&NetRules) -> f64,
+    ) -> f64 {
+        match (net_a, net_b) {
+            (Some(a), Some(b)) => field(&self.nets[a].rules).max(field(&self.nets[b].rules)),
+            (Some(a), None) => field(&self.nets[a].rules),
+            (None, Some(b)) => field(&self.nets[b].rules),
+            (None, None) => self.nets.first().map_or(100.0, |n| field(&n.rules)),
+        }
     }
 
     // Allows inward escape from a pad whose own copper sits closer than edge_clr to the boundary.
@@ -989,46 +1482,31 @@ impl Board {
     }
 
     pub fn wire_to_other_clearance(&self, net_a: usize, net_b: Option<usize>) -> f64 {
-        let ca = self.nets[net_a].rules.clearance;
-        match net_b {
-            Some(nb) => ca.max(self.nets[nb].rules.clearance),
-            None => ca,
-        }
+        self.pair_clearance(Some(net_a), net_b, |r| r.clearance)
     }
 
     pub fn via_to_wire_clearance(&self, net_a: usize, net_b: Option<usize>) -> f64 {
-        let ca = self.nets[net_a].rules.via_wire;
-        match net_b {
-            Some(nb) => ca.max(self.nets[nb].rules.via_wire),
-            None => ca,
-        }
+        self.pair_clearance(Some(net_a), net_b, |r| r.via_wire)
     }
 
     pub fn via_to_via_clearance(&self, net_a: usize, net_b: Option<usize>) -> f64 {
-        let ca = self.nets[net_a].rules.via_via;
-        match net_b {
-            Some(nb) => ca.max(self.nets[nb].rules.via_via),
-            None => ca,
-        }
+        self.pair_clearance(Some(net_a), net_b, |r| r.via_via)
     }
 
     pub fn via_to_pad_clearance(&self, net_a: usize, pad: &Pad) -> f64 {
-        let base = if pad.is_smd {
-            self.nets[net_a].rules.via_smd
-        } else {
-            self.nets[net_a].rules.via_via
-        };
-        match pad.net_id {
-            Some(nb) => {
-                let other = if pad.is_smd {
-                    self.nets[nb].rules.via_smd
-                } else {
-                    self.nets[nb].rules.via_via
-                };
-                base.max(other)
-            }
-            None => base,
-        }
+        self.pair_clearance(Some(net_a), pad.net_id, |r| {
+            if pad.is_smd { r.via_smd } else { r.via_via }
+        })
+    }
+}
+
+fn same_net(a: Option<usize>, b: Option<usize>) -> bool {
+    matches!((a, b), (Some(na), Some(nb)) if na == nb)
+}
+
+fn record_hit(slot: &mut Option<StaticHit>, cand: StaticHit) {
+    if slot.is_none_or(|best| cand.deficit > best.deficit) {
+        *slot = Some(cand);
     }
 }
 
