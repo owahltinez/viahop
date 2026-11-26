@@ -327,7 +327,7 @@ fn check_routable_nets_solo(
                     }
                     let nid = routable_nets[idx];
                     let net = &board.nets[nid];
-                    let components = build_net_components(board, grid, fanout, nid);
+                    let components = build_net_components(board, grid, fanout, nid, None);
                     if components.len() < 2 {
                         continue;
                     }

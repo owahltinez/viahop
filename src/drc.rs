@@ -28,7 +28,18 @@ pub struct DrcReport {
 
 /// Runs an exact continuous-geometry DRC check over all routed segments and vias.
 pub fn check_drc(board: &Board, routes: &[NetRoute]) -> DrcReport {
+    check_drc_scoped(board, routes, None)
+}
+
+/// Runs exact continuous-geometry DRC, restricting checks to violations involving `target_mask`.
+pub(crate) fn check_drc_scoped(
+    board: &Board,
+    routes: &[NetRoute],
+    target_mask: Option<&[bool]>,
+) -> DrcReport {
     let mut report = DrcReport::default();
+    let is_target =
+        |nid: usize| -> bool { target_mask.is_none_or(|m| m.get(nid).copied().unwrap_or(false)) };
 
     let mut all_segs: Vec<(usize, &RoutedSegment, BBox)> = Vec::new();
     let mut all_vias: Vec<(usize, &RoutedVia, BBox)> = Vec::new();
@@ -57,8 +68,45 @@ pub fn check_drc(board: &Board, routes: &[NetRoute]) -> DrcReport {
     let max_wire_clr = board.max_net_clearance;
     let max_via_clr = board.max_net_clearance.max(board.hole_to_hole_um);
 
-    // 1. Check routed segments against static obstacles & other routed segments.
+    let check_via_seg = |report: &mut DrcReport,
+                         via_net: usize,
+                         via: &RoutedVia,
+                         seg_net: usize,
+                         seg: &RoutedSegment| {
+        if !via.layers.contains(&seg.layer) {
+            return;
+        }
+        let req = board.via_to_wire_clearance(via_net, Some(seg_net));
+        let sh = Shape::Circle {
+            center: via.pos,
+            radius: via.radius,
+        };
+        let gap = sh.dist_to_capsule(seg.a, seg.b, seg.width * 0.5);
+        if gap < req - DRC_EPS {
+            if is_target(via_net) {
+                report.conflicting_nets.insert(via_net);
+            }
+            if is_target(seg_net) {
+                report.conflicting_nets.insert(seg_net);
+            }
+            report.violations.push(DrcViolation {
+                net_a: via_net,
+                net_b: Some(seg_net),
+                layer: Some(seg.layer),
+                pos: via.pos,
+                kind: "via_seg",
+                gap_um: gap,
+                required_um: req,
+                blocker: None,
+            });
+        }
+    };
+
+    // 1. Check routed segments against static obstacles, other routed segments, and non-target vias.
     for (idx, &(net_a, seg, bb)) in all_segs.iter().enumerate() {
+        if !is_target(net_a) {
+            continue;
+        }
         let half_w = seg.width * 0.5;
         if let Some(diag) = board.diagnose_segment_static_with_buf(
             net_a,
@@ -84,10 +132,11 @@ pub fn check_drc(board: &Board, routes: &[NetRoute]) -> DrcReport {
 
         seg_grid.query(bb.expand(max_wire_clr + 50.0), &mut buf);
         for &j in &buf {
-            if j <= idx {
+            let (net_b, seg_b, _) = all_segs[j];
+            let b_target = is_target(net_b);
+            if b_target && j <= idx {
                 continue;
             }
-            let (net_b, seg_b, _) = all_segs[j];
             if net_a == net_b || seg.layer != seg_b.layer {
                 continue;
             }
@@ -97,7 +146,9 @@ pub fn check_drc(board: &Board, routes: &[NetRoute]) -> DrcReport {
                 - seg_b.width * 0.5;
             if gap < req - DRC_EPS {
                 report.conflicting_nets.insert(net_a);
-                report.conflicting_nets.insert(net_b);
+                if b_target {
+                    report.conflicting_nets.insert(net_b);
+                }
                 report.violations.push(DrcViolation {
                     net_a,
                     net_b: Some(net_b),
@@ -110,10 +161,23 @@ pub fn check_drc(board: &Board, routes: &[NetRoute]) -> DrcReport {
                 });
             }
         }
+
+        if target_mask.is_some() {
+            via_grid.query(bb.expand(max_via_clr + 50.0), &mut buf);
+            for &j in &buf {
+                let (net_b, via_b, _) = all_vias[j];
+                if !is_target(net_b) {
+                    check_via_seg(&mut report, net_b, via_b, net_a, seg);
+                }
+            }
+        }
     }
 
     // 2. Check routed vias against static obstacles, other routed vias, and other routed segments.
     for (idx, &(net_a, via, bb)) in all_vias.iter().enumerate() {
+        if !is_target(net_a) {
+            continue;
+        }
         if let Some(diag) = board.diagnose_routed_via_static_with_buf(
             net_a,
             via.pos,
@@ -139,10 +203,11 @@ pub fn check_drc(board: &Board, routes: &[NetRoute]) -> DrcReport {
         let via_query_r = max_via_clr + via.drill * 0.5 + 50.0;
         via_grid.query(bb.expand(via_query_r), &mut buf);
         for &j in &buf {
-            if j <= idx {
+            let (net_b, via_b, _) = all_vias[j];
+            let b_target = is_target(net_b);
+            if b_target && j <= idx {
                 continue;
             }
-            let (net_b, via_b, _) = all_vias[j];
             if !via.layers.iter().any(|l| via_b.layers.contains(l)) {
                 continue;
             }
@@ -171,7 +236,9 @@ pub fn check_drc(board: &Board, routes: &[NetRoute]) -> DrcReport {
             let hole_bad = dist < min_hole_c2c - DRC_EPS;
             if copper_bad || hole_bad {
                 report.conflicting_nets.insert(net_a);
-                report.conflicting_nets.insert(net_b);
+                if b_target {
+                    report.conflicting_nets.insert(net_b);
+                }
                 let (gap_um, required_um) = if copper_bad {
                     (gap, req)
                 } else {
@@ -193,28 +260,8 @@ pub fn check_drc(board: &Board, routes: &[NetRoute]) -> DrcReport {
         seg_grid.query(bb.expand(max_via_clr + 50.0), &mut buf);
         for &j in &buf {
             let (net_b, seg_b, _) = all_segs[j];
-            if net_a == net_b || !via.layers.contains(&seg_b.layer) {
-                continue;
-            }
-            let req = board.via_to_wire_clearance(net_a, Some(net_b));
-            let sh = Shape::Circle {
-                center: via.pos,
-                radius: via.radius,
-            };
-            let gap = sh.dist_to_capsule(seg_b.a, seg_b.b, seg_b.width * 0.5);
-            if gap < req - DRC_EPS {
-                report.conflicting_nets.insert(net_a);
-                report.conflicting_nets.insert(net_b);
-                report.violations.push(DrcViolation {
-                    net_a,
-                    net_b: Some(net_b),
-                    layer: Some(seg_b.layer),
-                    pos: via.pos,
-                    kind: "via_seg",
-                    gap_um: gap,
-                    required_um: req,
-                    blocker: None,
-                });
+            if net_a != net_b {
+                check_via_seg(&mut report, net_a, via, net_b, seg_b);
             }
         }
     }

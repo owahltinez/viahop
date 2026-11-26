@@ -9,7 +9,7 @@ Fast, standalone, zero-dependency, MIT-licensed headless Specctra DSN/SES multi-
 - **Fast static preflight (`--preflight`)**: sub-second static feasibility check detecting sealed BGA balls, statically blocked net pairs, and pre-existing fixed-copper DRC violations with exact obstacle attribution (`exit 0` if clean, `1` if blocked).
 - **Parallel multi-start + bad-pass undo**: start 0 runs canonical ordering with zero overhead when clean; if unrouted pairs or DRC issues remain, shuffled seeds run in parallel and keep the best board while undoing degrading passes.
 - **Atomic checkpointing & graceful stop**: `-do` is updated atomically whenever a better solution is found; `Ctrl+C` (`SIGINT`/`SIGTERM`) or `--max-time` stops cleanly and keeps the best routed `.ses` on disk (a second signal exits immediately).
-- **Initial-session resume (`--initial-session`)**: load an existing `.ses` checkpoint, preserve clean routed nets, finish remaining connections, and run post-route optimization.
+- **Initial-session resume & local reroute (`--initial-session`, `--reroute-nets`)**: load an existing `.ses` checkpoint, preserve clean routed nets, finish remaining connections, or freeze non-target nets as static obstacles to locally reroute specific nets or net classes within a padded bounding box (`--reroute-pad-mm`).
 - **Structured JSON reports & diagnosis (`--report`, `--diagnose`)**: report every unrouted pair and DRC violation (with exact static blocker attribution), and test-route each unrouted pair alone on an empty grid to classify `congestion` vs static `blocked` geometry/rules.
 - **Pull-tight, POFV snapping & clean SES hygiene**: spatially indexed multi-segment octilinear shortcutting, inter-via layer flattening (via-pair elimination), collinear merging, centered POFV via snapping, T-junction/via-tap segment splitting, dead single-layer via pruning, and dangling stub pruning gated by zero-slack continuous DRC.
 - **Full KiCad 10 Specctra DSN/SES, DRC parity & coordinated BGA escape**: handles `um`/`mil`/`mm` resolutions, signal vs power layers, signal-layer `(plane ...)` polygon obstacles, board boundary polygons with configurable `--edge-clearance`, configurable drill `--hole-to-hole` clearance, structure and image keepouts, front/back placement mirroring and rotation, fixed wires/vias, per-class clearances, concentric BGA ring-depth escape planning, non-colliding dogbone vias, and centered POFV via-in-pad fanout for dense `0.40 mm` / `0.50 mm` BGAs.
@@ -46,6 +46,9 @@ viahop -i board.dsn --rules board.rules --ignore GND,AGND --via-at-smd --threads
 
 # Resume and optimize from an existing session checkpoint
 viahop -i board.dsn -o board_opt.ses --initial-session board.ses --max-passes 10
+
+# Locally rip up and reroute specific nets while freezing all other nets
+viahop -i board.dsn -o board_fix.ses --initial-session board.ses --reroute-nets CLK,CS --reroute-pad-mm 4.0
 ```
 
 Flags:
@@ -55,6 +58,8 @@ Flags:
 - `--max-passes <N>` (alias: `-mp`): max rip-up-and-reroute passes per start (default `20`)
 - `--multi-start <N>`: parallel shuffled starts if unrouted pairs or DRC issues remain (default `4`)
 - `--initial-session <FILE>`: resume routing/optimization from an existing `.ses` file
+- `--reroute-nets <LIST>`: comma-separated target net or class names to reroute while freezing other nets (repeatable)
+- `--reroute-pad-mm <MM>`: local search bbox padding in mm around rerouted nets (default `4.0` with `--initial-session`)
 - `--report <FILE>`: write detailed JSON report (stats, unrouted pairs, DRC violations)
 - `--diagnose`: with `--report`, classify unrouted pairs as `congestion` vs `blocked`
 - `--ignore <LIST>` (aliases: `-inc`, `--ignore-net-classes`): comma-separated ignored net classes or net names

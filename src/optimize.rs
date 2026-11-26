@@ -6,8 +6,8 @@ use std::collections::{HashMap, HashSet};
 use crate::board::{Board, NetRoute, RoutedSegment, RoutedVia, SpatialGrid};
 use crate::geometry::{BBox, Point, point_to_segment_dist, segment_to_segment_dist};
 
-/// Spatial index over all routed segments and vias for fast dynamic clearance checks.
-struct RouteSpatialIndex {
+/// Spatial index over routed segments and vias for fast continuous clearance checks.
+pub(crate) struct RouteSpatialIndex {
     segs: Vec<Option<(usize, RoutedSegment)>>,
     vias: Vec<Option<(usize, RoutedVia)>>,
     seg_grid: SpatialGrid,
@@ -19,6 +19,14 @@ struct RouteSpatialIndex {
 
 impl RouteSpatialIndex {
     fn build(board: &Board, routes: &[NetRoute]) -> Self {
+        Self::build_filtered(board, routes, |_| true)
+    }
+
+    pub(crate) fn build_filtered(
+        board: &Board,
+        routes: &[NetRoute],
+        include: impl Fn(usize) -> bool,
+    ) -> Self {
         let max_via_r = board
             .nets
             .iter()
@@ -26,6 +34,7 @@ impl RouteSpatialIndex {
             .chain(
                 routes
                     .iter()
+                    .filter(|nr| include(nr.net_id))
                     .flat_map(|nr| nr.vias.iter().map(|v| v.radius)),
             )
             .fold(0.0_f64, f64::max);
@@ -33,7 +42,12 @@ impl RouteSpatialIndex {
             .nets
             .iter()
             .map(|n| n.rules.via_drill)
-            .chain(routes.iter().flat_map(|nr| nr.vias.iter().map(|v| v.drill)))
+            .chain(
+                routes
+                    .iter()
+                    .filter(|nr| include(nr.net_id))
+                    .flat_map(|nr| nr.vias.iter().map(|v| v.drill)),
+            )
             .fold(0.0_f64, f64::max);
         let max_board_clr = (board.max_net_clearance + max_via_r)
             .max(board.hole_to_hole_um + max_via_d * 0.5 + 100.0)
@@ -48,9 +62,15 @@ impl RouteSpatialIndex {
             max_board_clr,
         };
         for (i, nr) in routes.iter().enumerate() {
-            idx.insert_net(i, nr);
+            if include(nr.net_id) {
+                idx.insert_net(i, nr);
+            }
         }
         idx
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.segs.is_empty() && self.vias.is_empty()
     }
 
     fn insert_net(&mut self, net_idx: usize, nr: &NetRoute) {
@@ -80,7 +100,7 @@ impl RouteSpatialIndex {
         self.insert_net(net_idx, nr);
     }
 
-    fn clears_segment(
+    pub(crate) fn clears_segment(
         &self,
         board: &Board,
         net_id: usize,
@@ -124,28 +144,32 @@ impl RouteSpatialIndex {
         true
     }
 
-    fn clears_via(
+    #[allow(clippy::too_many_arguments)]
+    fn clears_via_spec(
         &self,
         board: &Board,
         net_id: usize,
         pos: Point,
-        via: &RoutedVia,
+        radius: f64,
+        drill: f64,
+        layers: &[usize],
+        margin: f64,
         buf: &mut Vec<usize>,
     ) -> bool {
-        let qbox = BBox::from_point(pos, via.radius + self.max_board_clr + 50.0);
+        let qbox = BBox::from_point(pos, radius + self.max_board_clr + 50.0);
 
         self.via_grid.query(qbox, buf);
         for &slot in buf.iter() {
             let Some((other_net, ref ov)) = self.vias[slot] else {
                 continue;
             };
-            if other_net == net_id || !via.layers.iter().any(|l| ov.layers.contains(l)) {
+            if other_net == net_id || !layers.iter().any(|l| ov.layers.contains(l)) {
                 continue;
             }
             let dist = pos.dist(ov.pos);
             let req = board.via_to_via_clearance(net_id, Some(other_net));
-            let min_hole_c2c = (via.drill + ov.drill) * 0.5 + board.hole_to_hole_um;
-            if dist - via.radius - ov.radius < req || dist < min_hole_c2c {
+            let min_hole_c2c = (drill + ov.drill) * 0.5 + board.hole_to_hole_um;
+            if dist - radius - ov.radius < req + margin || dist < min_hole_c2c + margin {
                 return false;
             }
         }
@@ -155,21 +179,51 @@ impl RouteSpatialIndex {
             let Some((other_net, ref seg)) = self.segs[slot] else {
                 continue;
             };
-            if other_net == net_id || !via.layers.contains(&seg.layer) {
+            if other_net == net_id || !layers.contains(&seg.layer) {
                 continue;
             }
             let req = board.via_to_wire_clearance(net_id, Some(other_net));
-            let gap = point_to_segment_dist(pos, seg.a, seg.b) - via.radius - seg.width * 0.5;
-            if gap < req {
+            let gap = point_to_segment_dist(pos, seg.a, seg.b) - radius - seg.width * 0.5;
+            if gap < req + margin {
                 return false;
             }
         }
         true
     }
+
+    pub(crate) fn clears_via(
+        &self,
+        board: &Board,
+        net_id: usize,
+        pos: Point,
+        margin: f64,
+        buf: &mut Vec<usize>,
+    ) -> bool {
+        let rules = &board.nets[net_id].rules;
+        self.clears_via_spec(
+            board,
+            net_id,
+            pos,
+            rules.via_radius,
+            rules.via_drill,
+            &rules.via_layers,
+            margin,
+            buf,
+        )
+    }
 }
 
 /// Optimizes routed nets in-place while preserving electrical connectivity and DRC cleanliness.
 pub fn optimize_routes(board: &Board, routes: &mut [NetRoute]) {
+    optimize_routes_subset(board, routes, None);
+}
+
+/// Optimizes routed nets in-place, editing only `target_mask` when set while indexing all nets.
+pub(crate) fn optimize_routes_subset(
+    board: &Board,
+    routes: &mut [NetRoute],
+    target_mask: Option<&[bool]>,
+) {
     let mut index = RouteSpatialIndex::build(board, routes);
     let mut qbuf = Vec::new();
     let mut sbuf = Vec::new();
@@ -177,6 +231,11 @@ pub fn optimize_routes(board: &Board, routes: &mut [NetRoute]) {
     for _round in 0..3 {
         let mut any_changed = false;
         for (idx, nr) in routes.iter_mut().enumerate() {
+            if let Some(mask) = target_mask
+                && !mask.get(nr.net_id).copied().unwrap_or(false)
+            {
+                continue;
+            }
             if nr.segments.is_empty() && nr.vias.is_empty() {
                 continue;
             }
@@ -216,17 +275,41 @@ pub fn optimize_routes(board: &Board, routes: &mut [NetRoute]) {
     }
 
     for nr in routes.iter_mut() {
+        if let Some(mask) = target_mask
+            && !mask.get(nr.net_id).copied().unwrap_or(false)
+        {
+            continue;
+        }
         nr.segments = split_segments_at_junctions(&nr.segments, &nr.vias);
     }
 }
 
 /// Applies final route hygiene: dead-via pruning, POFV via snapping, and T-junction splitting.
 pub fn finalize_routes(board: &Board, routes: &mut [NetRoute]) {
+    finalize_routes_subset(board, routes, None);
+}
+
+/// Applies final route hygiene, editing only `target_mask` when set while indexing all nets.
+pub(crate) fn finalize_routes_subset(
+    board: &Board,
+    routes: &mut [NetRoute],
+    target_mask: Option<&[bool]>,
+) {
     for nr in routes.iter_mut() {
+        if let Some(mask) = target_mask
+            && !mask.get(nr.net_id).copied().unwrap_or(false)
+        {
+            continue;
+        }
         prune_dead_vias(board, nr);
     }
-    snap_pofv_vias(board, routes);
+    snap_pofv_vias_subset(board, routes, target_mask);
     for nr in routes.iter_mut() {
+        if let Some(mask) = target_mask
+            && !mask.get(nr.net_id).copied().unwrap_or(false)
+        {
+            continue;
+        }
         prune_dead_vias(board, nr);
         nr.segments = split_segments_at_junctions(&nr.segments, &nr.vias);
     }
@@ -234,6 +317,10 @@ pub fn finalize_routes(board: &Board, routes: &mut [NetRoute]) {
 
 /// Snaps off-center routed vias falling within a same-net SMD pad to exact `pad.center` when DRC-safe.
 pub fn snap_pofv_vias(board: &Board, routes: &mut [NetRoute]) {
+    snap_pofv_vias_subset(board, routes, None);
+}
+
+fn snap_pofv_vias_subset(board: &Board, routes: &mut [NetRoute], target_mask: Option<&[bool]>) {
     if !board.via_at_smd {
         return;
     }
@@ -241,6 +328,11 @@ pub fn snap_pofv_vias(board: &Board, routes: &mut [NetRoute]) {
     let mut qbuf = Vec::new();
     let mut sbuf = Vec::new();
     for (idx, nr) in routes.iter_mut().enumerate() {
+        if let Some(mask) = target_mask
+            && !mask.get(nr.net_id).copied().unwrap_or(false)
+        {
+            continue;
+        }
         if snap_pofv_vias_for_net(board, nr, &index, &mut qbuf, &mut sbuf) {
             index.update_net(idx, nr);
         }
@@ -312,23 +404,30 @@ fn snap_pofv_vias_for_net(
             &old_via.layers,
             0.0,
             sbuf,
-        ) && index.clears_via(board, net_id, new_pos, &old_via, qbuf)
-            && nr.vias.iter().enumerate().all(|(j, sv)| {
-                if j == vi || !old_via.layers.iter().any(|l| sv.layers.contains(l)) {
-                    return true;
-                }
-                let dist = new_pos.dist(sv.pos);
-                let min_hole_c2c = (old_via.drill + sv.drill) * 0.5 + board.hole_to_hole_um;
-                (dist < 1.0 && old_via.layers.iter().all(|l| sv.layers.contains(l)))
-                    || dist >= min_hole_c2c
-            })
-            && board.fixed_vias.iter().all(|fv| {
-                if fv.net_id != Some(net_id) {
-                    return true;
-                }
-                let min_hole_c2c = (old_via.drill + fv.drill) * 0.5 + board.hole_to_hole_um;
-                new_pos.dist(fv.pos) >= min_hole_c2c
-            });
+        ) && index.clears_via_spec(
+            board,
+            net_id,
+            new_pos,
+            old_via.radius,
+            old_via.drill,
+            &old_via.layers,
+            0.0,
+            qbuf,
+        ) && nr.vias.iter().enumerate().all(|(j, sv)| {
+            if j == vi || !old_via.layers.iter().any(|l| sv.layers.contains(l)) {
+                return true;
+            }
+            let dist = new_pos.dist(sv.pos);
+            let min_hole_c2c = (old_via.drill + sv.drill) * 0.5 + board.hole_to_hole_um;
+            (dist < 1.0 && old_via.layers.iter().all(|l| sv.layers.contains(l)))
+                || dist >= min_hole_c2c
+        }) && board.fixed_vias.iter().all(|fv| {
+            if fv.net_id != Some(net_id) {
+                return true;
+            }
+            let min_hole_c2c = (old_via.drill + fv.drill) * 0.5 + board.hole_to_hole_um;
+            new_pos.dist(fv.pos) >= min_hole_c2c
+        });
         if !via_ok {
             vi += 1;
             continue;

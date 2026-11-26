@@ -10,7 +10,7 @@ use std::sync::Mutex;
 
 use viahop::{
     Board, BoardOptions, DsnDesign, RouteReport, RouteScore, RouterConfig, parse_ses,
-    route_board_with_checkpoint, run_preflight_with_options, ses, signal,
+    route_board_with_checkpoint, run_preflight_with_options, ses, signal, validate_reroute_nets,
 };
 
 struct CliArgs {
@@ -18,6 +18,8 @@ struct CliArgs {
     output_ses: Option<String>,
     rules_file: Option<String>,
     initial_session: Option<String>,
+    reroute_nets: Option<HashSet<String>>,
+    reroute_pad_mm: Option<f64>,
     report_file: Option<String>,
     diagnose: bool,
     preflight: bool,
@@ -72,6 +74,8 @@ fn parse_args(args: &[String]) -> Result<Action, String> {
     let mut output_ses: Option<String> = None;
     let mut rules_file: Option<String> = None;
     let mut initial_session: Option<String> = None;
+    let mut reroute_nets: Option<HashSet<String>> = None;
+    let mut reroute_pad_mm: Option<f64> = None;
     let mut report_file: Option<String> = None;
     let mut diagnose = false;
     let mut preflight = false;
@@ -109,6 +113,31 @@ fn parse_args(args: &[String]) -> Result<Action, String> {
             "-o" | "-do" | "--output" => output_ses = Some(next_val(&mut i, flag, inline_val)?),
             "-dr" | "--rules" => rules_file = Some(next_val(&mut i, flag, inline_val)?),
             "--initial-session" => initial_session = Some(next_val(&mut i, flag, inline_val)?),
+            "--reroute-nets" => {
+                let v = next_val(&mut i, flag, inline_val)?;
+                let set = reroute_nets.get_or_insert_with(HashSet::new);
+                let mut added = 0;
+                for item in v.split(',') {
+                    let trimmed = item.trim();
+                    if !trimmed.is_empty() {
+                        set.insert(trimmed.to_string());
+                        added += 1;
+                    }
+                }
+                if added == 0 {
+                    return Err(format!("{flag} requires at least one net or class name"));
+                }
+            }
+            "--reroute-pad-mm" => {
+                let v = next_val(&mut i, flag, inline_val)?;
+                let mm = v
+                    .parse::<f64>()
+                    .map_err(|_| format!("invalid positive number for {flag}: {v}"))?;
+                if !mm.is_finite() || mm <= 0.0 {
+                    return Err(format!("{flag} must be a positive number: {v}"));
+                }
+                reroute_pad_mm = Some(mm);
+            }
             "--report" => report_file = Some(next_val(&mut i, flag, inline_val)?),
             "--diagnose" => diagnose = true,
             "--preflight" => preflight = true,
@@ -169,12 +198,17 @@ fn parse_args(args: &[String]) -> Result<Action, String> {
     if !preflight && output_ses.is_none() {
         return Err("missing required output SES (-do <OUTPUT.ses>)".to_string());
     }
+    if reroute_pad_mm.is_some() && reroute_nets.is_none() {
+        return Err("--reroute-pad-mm requires --reroute-nets".to_string());
+    }
 
     Ok(Action::Run(Box::new(CliArgs {
         input_dsn,
         output_ses,
         rules_file,
         initial_session,
+        reroute_nets,
+        reroute_pad_mm,
         report_file,
         diagnose,
         preflight,
@@ -221,6 +255,9 @@ fn run(cli: CliArgs) -> Result<ExitCode, String> {
     };
     let board =
         Board::from_dsn_with_options(&design, &cli.ignored_nets, cli.via_at_smd, board_opts)?;
+    if let Some(ref targets) = cli.reroute_nets {
+        validate_reroute_nets(&board, targets)?;
+    }
     if cli.preflight {
         let report = run_preflight_with_options(&board, cli.threads, cli.timeout_secs, None);
         if let Some(ref report_path) = cli.report_file {
@@ -277,6 +314,8 @@ fn run(cli: CliArgs) -> Result<ExitCode, String> {
         optimize: true,
         multi_start: cli.multi_start,
         initial_routes,
+        reroute_nets: cli.reroute_nets,
+        reroute_pad_um: cli.reroute_pad_mm.map(|mm| mm * 1000.0),
         stop_flag: None,
     };
 
@@ -342,6 +381,8 @@ OPTIONS:\n  \
   --max-passes <N>             Max rip-up-and-reroute passes per start, default 20 (alias: -mp)\n  \
   --multi-start <N>            Parallel shuffled starts if unrouted remain (default: 4)\n  \
   --initial-session <FILE>     Resume routing/optimization from an existing SES file\n  \
+  --reroute-nets <LIST>        Comma-separated target nets or classes to reroute (repeatable)\n  \
+  --reroute-pad-mm <MM>        Local search padding in mm around rerouted nets (default: 4.0)\n  \
   --report <FILE>              Write detailed JSON report (stats, unrouted, violations)\n  \
   --diagnose                   With --report, classify unrouted pairs (congestion vs blocked)\n  \
   --ignore <LIST>              Comma-separated ignored net classes or nets (alias: -inc)\n  \

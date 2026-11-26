@@ -169,7 +169,7 @@ fn diagnose_unrouted_pairs(
         if net.ignored || net.pad_ids.len() < 2 {
             continue;
         }
-        let components = build_net_components(board, &grid, &fanout, net.id);
+        let components = build_net_components(board, &grid, &fanout, net.id, None);
         if components.len() < 2 {
             continue;
         }
@@ -260,6 +260,7 @@ pub(crate) fn solo_pair_block_reason(
         &[],
         min_via_dist,
         &params,
+        None,
         scratch,
     )
     .is_some()

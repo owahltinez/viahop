@@ -29,7 +29,9 @@ pub use preflight::{
     run_preflight, run_preflight_with_options,
 };
 pub use report::{RouteReport, UnroutedConnection, UnroutedKind, ViolationDetail};
-pub use router::{RouteStats, RouterConfig, route_board, route_board_with_checkpoint};
+pub use router::{
+    RouteStats, RouterConfig, route_board, route_board_with_checkpoint, validate_reroute_nets,
+};
 pub use ses::parse_ses;
 
 /// Complete result of routing a parsed Specctra DSN design.
@@ -71,6 +73,9 @@ pub fn route(design: &DsnDesign, config: &RouterConfig) -> Result<RouteResult, S
     };
     let board =
         Board::from_dsn_with_options(design, &config.ignored_nets, config.via_at_smd, options)?;
+    if let Some(ref targets) = config.reroute_nets {
+        router::validate_reroute_nets(&board, targets)?;
+    }
     let inner = router::route_board(&board, config);
     Ok(RouteResult {
         board,
@@ -95,6 +100,9 @@ where
     };
     let board =
         Board::from_dsn_with_options(design, &config.ignored_nets, config.via_at_smd, options)?;
+    if let Some(ref targets) = config.reroute_nets {
+        router::validate_reroute_nets(&board, targets)?;
+    }
     let hook = |routes: &[NetRoute], score: RouteScore| on_best(&board, routes, score);
     let inner = router::route_board_with_checkpoint(&board, config, Some(&hook));
     Ok(RouteResult {
