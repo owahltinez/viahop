@@ -635,6 +635,7 @@ fn static_drc_attributes_exact_blockers_in_drc_and_report_json() {
         passes_run: 0,
         starts_run: 1,
         drc_violations: drc.violations.len(),
+        length_violations: 0,
         dense_bga_pads: 0,
         pofv_capable_pads: 0,
         grid_step_um: 50.0,

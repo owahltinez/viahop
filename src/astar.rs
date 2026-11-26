@@ -18,6 +18,7 @@ pub(crate) struct Anchor {
     pub(crate) bias: f32,
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct PassParams {
     pub(crate) present_factor: f32,
     pub(crate) h_weight: f32,

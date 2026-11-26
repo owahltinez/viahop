@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, HashSet};
 use crate::board::{Board, NetRoute};
 use crate::drc::check_drc_scoped;
 use crate::geometry::{point_to_segment_dist, segment_to_segment_dist};
+use crate::length::{LengthConstraints, evaluate_lengths};
 use crate::optimize::route_wirelength;
 use crate::router::{Terminal, uf_find};
 
@@ -13,6 +14,8 @@ use crate::router::{Terminal, uf_find};
 pub struct RouteScore {
     pub unconnected_pairs: usize,
     pub drc_violations: usize,
+    pub length_violations: usize,
+    pub length_excess_um: f64,
     pub total_vias: usize,
     pub wirelength_um: f64,
 }
@@ -21,17 +24,18 @@ impl RouteScore {
     pub const WORST: Self = Self {
         unconnected_pairs: usize::MAX,
         drc_violations: usize::MAX,
+        length_violations: usize::MAX,
+        length_excess_um: f64::INFINITY,
         total_vias: usize::MAX,
         wirelength_um: f64::INFINITY,
     };
 
     #[inline]
     pub fn is_perfect(self) -> bool {
-        self.unconnected_pairs == 0 && self.drc_violations == 0
+        self.unconnected_pairs == 0 && self.drc_violations == 0 && self.length_violations == 0
     }
 
-    /// Strictly prefers fewer unconnected pairs, then fewer DRC violations,
-    /// then fewer vias, then shorter total copper wirelength.
+    /// Orders by unconnected pairs, DRC, length violations, length excess, vias, then wirelength.
     #[inline]
     pub fn is_better_than(self, other: Self) -> bool {
         if self.unconnected_pairs != other.unconnected_pairs {
@@ -40,6 +44,12 @@ impl RouteScore {
         if self.drc_violations != other.drc_violations {
             return self.drc_violations < other.drc_violations;
         }
+        if self.length_violations != other.length_violations {
+            return self.length_violations < other.length_violations;
+        }
+        if (self.length_excess_um - other.length_excess_um).abs() > 0.1 {
+            return self.length_excess_um < other.length_excess_um;
+        }
         if self.total_vias != other.total_vias {
             return self.total_vias < other.total_vias;
         }
@@ -47,9 +57,13 @@ impl RouteScore {
     }
 }
 
-/// Evaluates a full board routing using exact continuous DRC and total copper metrics.
-pub fn score_routes(board: &Board, routes: &[NetRoute]) -> (RouteScore, crate::drc::DrcReport) {
-    score_routes_scoped(board, routes, None)
+/// Evaluates a full board routing including optional max-length and match-group constraints.
+pub fn score_routes(
+    board: &Board,
+    routes: &[NetRoute],
+    constraints: &LengthConstraints,
+) -> (RouteScore, crate::drc::DrcReport) {
+    score_routes_scoped(board, routes, None, constraints)
 }
 
 /// Evaluates routing quality scoped to `target_mask` for unconnected pairs and DRC violations.
@@ -57,6 +71,7 @@ pub(crate) fn score_routes_scoped(
     board: &Board,
     routes: &[NetRoute],
     target_mask: Option<&[bool]>,
+    constraints: &LengthConstraints,
 ) -> (RouteScore, crate::drc::DrcReport) {
     let drc = check_drc_scoped(board, routes, target_mask);
     let unconnected_pairs: usize = routes
@@ -64,11 +79,16 @@ pub(crate) fn score_routes_scoped(
         .filter(|r| target_mask.is_none_or(|m| m.get(r.net_id).copied().unwrap_or(false)))
         .map(|r| r.unconnected_pairs)
         .sum();
+    let len_report = evaluate_lengths(board, routes, constraints);
+    let length_violations = len_report.violations.len();
+    let length_excess_um: f64 = len_report.violations.iter().map(|v| v.excess_um).sum();
     let total_vias: usize = routes.iter().map(|r| r.vias.len()).sum();
     let wirelength_um: f64 = routes.iter().map(route_wirelength).sum();
     let score = RouteScore {
         unconnected_pairs,
         drc_violations: drc.violations.len(),
+        length_violations,
+        length_excess_um,
         total_vias,
         wirelength_um,
     };

@@ -4,7 +4,8 @@ Fast, standalone, zero-dependency, MIT-licensed headless Specctra DSN/SES multi-
 
 ## Features
 
-- **Freerouting-compatible CLI + modern flags**: drop-in headless invocation (`-de`, `-do`, `-mp`, `-inc`, `-mt`, `-dr`, `-dl`, `--via-at-smd`, `--timeout`/`--max-time`, `--json-summary`) plus `--preflight`, `--multi-start`, `--initial-session`, `--report`, and `--diagnose`.
+- **Freerouting-compatible CLI + modern flags**: drop-in headless invocation (`-de`, `-do`, `-mp`, `-inc`, `-mt`, `-dr`, `-dl`, `--via-at-smd`, `--timeout`/`--max-time`, `--json-summary`) plus `--preflight`, `--multi-start`, `--initial-session`, `--reroute-nets`, `--max-length`, `--match-group`, `--report`, and `--diagnose`.
+- **Length & skew constraints (`--max-length`, `--match-group`)**: prioritize length-budgeted nets (including `,`- or `+`-chained series-resistor nets) and insert DRC-gated octilinear trombone meanders post-optimization to match bus and differential-pair lengths.
 - **Rust library + C-ABI (`rlib` + `cdylib`)**: direct in-process integration from Rust, C/C++, Python `ctypes`, or KiCad plugins (`include/viahop.h`).
 - **Fast static preflight (`--preflight`)**: sub-second static feasibility check detecting sealed BGA balls, statically blocked net pairs, and pre-existing fixed-copper DRC violations with exact obstacle attribution (`exit 0` if clean, `1` if blocked).
 - **Parallel multi-start + bad-pass undo**: start 0 runs canonical ordering with zero overhead when clean; if unrouted pairs or DRC issues remain, shuffled seeds run in parallel and keep the best board while undoing degrading passes.
@@ -49,6 +50,13 @@ viahop -i board.dsn -o board_opt.ses --initial-session board.ses --max-passes 10
 
 # Locally rip up and reroute specific nets while freezing all other nets
 viahop -i board.dsn -o board_fix.ses --initial-session board.ses --reroute-nets CLK,CS --reroute-pad-mm 4.0
+
+# Enforce max-length budgets and matched-length bus/diff-pair skew tuning
+viahop -i board.dsn -o board.ses \
+  --max-length /PDM_CLK+/Audio/PDM_CLK_MIC=40mm \
+  --match-group QSPI:CLK,IO0,IO1,IO2:0.5mm \
+  --match-group DP:USB_DP,USB_DM:0.1mm@15mm \
+  --report report.json
 ```
 
 Flags:
@@ -60,7 +68,9 @@ Flags:
 - `--initial-session <FILE>`: resume routing/optimization from an existing `.ses` file
 - `--reroute-nets <LIST>`: comma-separated target net or class names to reroute while freezing other nets (repeatable)
 - `--reroute-pad-mm <MM>`: local search bbox padding in mm around rerouted nets (default `4.0` with `--initial-session`)
-- `--report <FILE>`: write detailed JSON report (stats, unrouted pairs, DRC violations)
+- `--max-length <SPEC>`: repeatable max length constraint `NET[,NET2...]=LEN` or `NET[+NET2...]=LEN` (`mm`/`um`/`mil`, default `mm`; use `,` when net names contain `+`)
+- `--match-group <SPEC>`: repeatable skew group `NAME:NET1,NET2,...:TOL[@TARGET]` with DRC-gated meander tuning
+- `--report <FILE>`: write detailed JSON report (stats, unrouted pairs, DRC violations, length checks)
 - `--diagnose`: with `--report`, classify unrouted pairs as `congestion` vs `blocked`
 - `--ignore <LIST>` (aliases: `-inc`, `--ignore-net-classes`): comma-separated ignored net classes or net names
 - `--threads <N>` (alias: `-mt`): worker threads (default `1`)

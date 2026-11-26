@@ -9,6 +9,7 @@ pub mod fanout;
 pub mod ffi;
 pub mod geometry;
 pub mod grid;
+pub mod length;
 pub mod optimize;
 pub mod preflight;
 pub mod report;
@@ -24,6 +25,10 @@ pub use connectivity::RouteScore;
 pub use drc::{DrcReport, DrcViolation, check_drc};
 pub use dsn::DsnDesign;
 pub use fanout::{BgaCluster, FanoutPlan, PadFanout, analyze_fanout};
+pub use length::{
+    LengthConstraints, LengthReport, MatchGroupConstraint, MaxLengthConstraint,
+    parse_match_group_spec, parse_max_length_spec,
+};
 pub use preflight::{
     BgaClusterSummary, BlockedNetPair, FixedViolation, PreflightReport, SealedPadInfo,
     run_preflight, run_preflight_with_options,
@@ -45,7 +50,7 @@ pub struct RouteResult {
 impl RouteStats {
     pub fn to_json(&self) -> String {
         format!(
-            "{{\"total_nets\":{},\"routable_nets\":{},\"routed_nets\":{},\"unconnected_pairs\":{},\"total_segments\":{},\"total_vias\":{},\"total_wirelength_um\":{:.1},\"passes_run\":{},\"starts_run\":{},\"drc_violations\":{},\"dense_bga_pads\":{},\"pofv_capable_pads\":{},\"grid_step_um\":{:.1},\"stopped_early\":{},\"elapsed_ms\":{}}}",
+            "{{\"total_nets\":{},\"routable_nets\":{},\"routed_nets\":{},\"unconnected_pairs\":{},\"total_segments\":{},\"total_vias\":{},\"total_wirelength_um\":{:.1},\"passes_run\":{},\"starts_run\":{},\"drc_violations\":{},\"length_violations\":{},\"dense_bga_pads\":{},\"pofv_capable_pads\":{},\"grid_step_um\":{:.1},\"stopped_early\":{},\"elapsed_ms\":{}}}",
             self.total_nets,
             self.routable_nets,
             self.routed_nets,
@@ -56,6 +61,7 @@ impl RouteStats {
             self.passes_run,
             self.starts_run,
             self.drc_violations,
+            self.length_violations,
             self.dense_bga_pads,
             self.pofv_capable_pads,
             self.grid_step_um,
@@ -76,6 +82,7 @@ pub fn route(design: &DsnDesign, config: &RouterConfig) -> Result<RouteResult, S
     if let Some(ref targets) = config.reroute_nets {
         router::validate_reroute_nets(&board, targets)?;
     }
+    config.length_constraints.validate(&board)?;
     let inner = router::route_board(&board, config);
     Ok(RouteResult {
         board,
@@ -103,6 +110,7 @@ where
     if let Some(ref targets) = config.reroute_nets {
         router::validate_reroute_nets(&board, targets)?;
     }
+    config.length_constraints.validate(&board)?;
     let hook = |routes: &[NetRoute], score: RouteScore| on_best(&board, routes, score);
     let inner = router::route_board_with_checkpoint(&board, config, Some(&hook));
     Ok(RouteResult {

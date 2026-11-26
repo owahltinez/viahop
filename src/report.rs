@@ -9,6 +9,7 @@ use crate::drc::check_drc;
 use crate::fanout::analyze_fanout;
 use crate::geometry::Point;
 use crate::grid::RoutingGrid;
+use crate::length::{LengthConstraints, LengthReport, evaluate_lengths};
 use crate::router::{RouteStats, Terminal, build_mst, build_net_components};
 
 /// Classification of why an unconnected net pair failed to route.
@@ -50,13 +51,29 @@ pub struct RouteReport {
     pub stats: RouteStats,
     pub unrouted: Vec<UnroutedConnection>,
     pub violations: Vec<ViolationDetail>,
+    pub length_report: LengthReport,
 }
 
 impl RouteReport {
-    /// Builds a detailed report from a completed routing run. When `diagnose` is true,
-    /// each unrouted pair is test-routed alone on an empty grid to distinguish congestion
-    /// from hard static/rule blockages.
+    /// Builds a detailed report from a completed routing run without length constraints.
     pub fn build(board: &Board, routes: &[NetRoute], stats: RouteStats, diagnose: bool) -> Self {
+        Self::build_with_constraints(
+            board,
+            routes,
+            stats,
+            diagnose,
+            &LengthConstraints::default(),
+        )
+    }
+
+    /// Builds a detailed report including length and skew constraint evaluations.
+    pub fn build_with_constraints(
+        board: &Board,
+        routes: &[NetRoute],
+        stats: RouteStats,
+        diagnose: bool,
+        constraints: &LengthConstraints,
+    ) -> Self {
         let drc = check_drc(board, routes);
         let violations = drc
             .violations
@@ -74,10 +91,12 @@ impl RouteReport {
             .collect();
 
         let unrouted = diagnose_unrouted_pairs(board, routes, diagnose);
+        let length_report = evaluate_lengths(board, routes, constraints);
         Self {
             stats,
             unrouted,
             violations,
+            length_report,
         }
     }
 
@@ -146,6 +165,80 @@ impl RouteReport {
                 v.gap_um,
                 v.required_um,
                 blocker,
+            );
+        }
+        let _ = writeln!(out, "  ],");
+
+        let _ = writeln!(out, "  \"length_checks\": {{");
+        let _ = writeln!(out, "    \"max_lengths\": [");
+        for (i, ml) in self.length_report.max_lengths.iter().enumerate() {
+            let comma = if i + 1 < self.length_report.max_lengths.len() {
+                ","
+            } else {
+                ""
+            };
+            let nets_json: Vec<String> = ml.nets.iter().map(|n| json_str(n)).collect();
+            let _ = writeln!(
+                out,
+                "      {{\"nets\":[{}],\"actual_um\":{:.1},\"max_um\":{:.1},\"passed\":{}}}{comma}",
+                nets_json.join(","),
+                ml.actual_um,
+                ml.max_um,
+                ml.passed,
+            );
+        }
+        let _ = writeln!(out, "    ],");
+        let _ = writeln!(out, "    \"match_groups\": [");
+        for (i, mg) in self.length_report.match_groups.iter().enumerate() {
+            let comma = if i + 1 < self.length_report.match_groups.len() {
+                ","
+            } else {
+                ""
+            };
+            let members_json: Vec<String> = mg
+                .members
+                .iter()
+                .map(|m| {
+                    format!(
+                        "{{\"net\":{},\"length_um\":{:.1}}}",
+                        json_str(&m.net),
+                        m.length_um
+                    )
+                })
+                .collect();
+            let _ = writeln!(
+                out,
+                "      {{\"name\":{},\"target_um\":{:.1},\"min_um\":{:.1},\"max_um\":{:.1},\"skew_um\":{:.1},\"tolerance_um\":{:.1},\"passed\":{},\"members\":[{}]}}{comma}",
+                json_str(&mg.name),
+                mg.target_um,
+                mg.min_um,
+                mg.max_um,
+                mg.skew_um,
+                mg.tolerance_um,
+                mg.passed,
+                members_json.join(","),
+            );
+        }
+        let _ = writeln!(out, "    ]");
+        let _ = writeln!(out, "  }},");
+
+        let _ = writeln!(out, "  \"length_violations\": [");
+        for (i, lv) in self.length_report.violations.iter().enumerate() {
+            let comma = if i + 1 < self.length_report.violations.len() {
+                ","
+            } else {
+                ""
+            };
+            let nets_json: Vec<String> = lv.nets.iter().map(|n| json_str(n)).collect();
+            let _ = writeln!(
+                out,
+                "    {{\"kind\":{},\"name\":{},\"nets\":[{}],\"actual_um\":{:.1},\"limit_um\":{:.1},\"excess_um\":{:.1}}}{comma}",
+                json_str(lv.kind),
+                json_str(&lv.name),
+                nets_json.join(","),
+                lv.actual_um,
+                lv.limit_um,
+                lv.excess_um,
             );
         }
         let _ = writeln!(out, "  ]");
