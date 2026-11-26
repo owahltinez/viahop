@@ -1,6 +1,6 @@
 [package]
 name = "viahop"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 description = "Fast, standalone, zero-dependency headless Specctra DSN/SES multi-layer PCB autorouter"
 license = "MIT"
