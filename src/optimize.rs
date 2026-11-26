@@ -6,8 +6,8 @@ use std::collections::{HashMap, HashSet};
 use crate::board::{Board, NetRoute, RoutedSegment, RoutedVia, SpatialGrid};
 use crate::geometry::{BBox, Point, point_to_segment_dist, segment_to_segment_dist};
 
-/// Spatial index over all routed segments and vias for fast dynamic clearance checks.
-struct RouteSpatialIndex {
+/// Spatial index over routed segments and vias for fast continuous clearance checks.
+pub(crate) struct RouteSpatialIndex {
     segs: Vec<Option<(usize, RoutedSegment)>>,
     vias: Vec<Option<(usize, RoutedVia)>>,
     seg_grid: SpatialGrid,
@@ -19,10 +19,21 @@ struct RouteSpatialIndex {
 
 impl RouteSpatialIndex {
     fn build(board: &Board, routes: &[NetRoute]) -> Self {
+        Self::build_filtered(board, routes, |_| true)
+    }
+
+    pub(crate) fn build_filtered(
+        board: &Board,
+        routes: &[NetRoute],
+        include: impl Fn(usize) -> bool,
+    ) -> Self {
         let max_board_clr = board
             .nets
             .iter()
-            .map(|n| n.rules.clearance.max(n.rules.via_wire) + n.rules.via_radius)
+            .map(|n| {
+                (n.rules.clearance.max(n.rules.via_wire).max(n.rules.via_via) + n.rules.via_radius)
+                    .max(n.rules.via_drill + 210.0)
+            })
             .fold(250.0_f64, f64::max);
         let mut idx = Self {
             segs: Vec::new(),
@@ -34,9 +45,15 @@ impl RouteSpatialIndex {
             max_board_clr,
         };
         for (i, nr) in routes.iter().enumerate() {
-            idx.insert_net(i, nr);
+            if include(nr.net_id) {
+                idx.insert_net(i, nr);
+            }
         }
         idx
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.segs.is_empty() && self.vias.is_empty()
     }
 
     fn insert_net(&mut self, net_idx: usize, nr: &NetRoute) {
@@ -66,7 +83,7 @@ impl RouteSpatialIndex {
         self.insert_net(net_idx, nr);
     }
 
-    fn clears_segment(
+    pub(crate) fn clears_segment(
         &self,
         board: &Board,
         net_id: usize,
@@ -108,6 +125,50 @@ impl RouteSpatialIndex {
         }
         true
     }
+
+    pub(crate) fn clears_via(
+        &self,
+        board: &Board,
+        net_id: usize,
+        pos: Point,
+        buf: &mut Vec<usize>,
+    ) -> bool {
+        let rules = &board.nets[net_id].rules;
+        let r = rules.via_radius;
+        let qbox = BBox::from_point(pos, r + self.max_board_clr + 50.0);
+
+        self.seg_grid.query(qbox, buf);
+        for &slot in buf.iter() {
+            let Some((other_net, ref seg)) = self.segs[slot] else {
+                continue;
+            };
+            if other_net == net_id || !rules.via_layers.contains(&seg.layer) {
+                continue;
+            }
+            let req = board.via_to_wire_clearance(net_id, Some(other_net));
+            let gap = point_to_segment_dist(pos, seg.a, seg.b) - seg.width * 0.5 - r;
+            if gap < req + 0.5 {
+                return false;
+            }
+        }
+
+        self.via_grid.query(qbox, buf);
+        for &slot in buf.iter() {
+            let Some((other_net, ref via)) = self.vias[slot] else {
+                continue;
+            };
+            if other_net == net_id || !via.layers.iter().any(|l| rules.via_layers.contains(l)) {
+                continue;
+            }
+            let dist = pos.dist(via.pos);
+            let req = board.via_to_via_clearance(net_id, Some(other_net));
+            let hole_c2c = (rules.via_drill + via.drill) * 0.5 + 205.0;
+            if dist - r - via.radius < req + 0.5 || dist < hole_c2c {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 /// Optimizes routed nets in-place while preserving electrical connectivity and DRC cleanliness.
@@ -116,7 +177,7 @@ pub fn optimize_routes(board: &Board, routes: &mut [NetRoute]) {
 }
 
 /// Optimizes routed nets in-place, editing only `target_mask` when set while indexing all nets.
-pub fn optimize_routes_subset(
+pub(crate) fn optimize_routes_subset(
     board: &Board,
     routes: &mut [NetRoute],
     target_mask: Option<&[bool]>,

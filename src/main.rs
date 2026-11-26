@@ -10,7 +10,7 @@ use std::sync::Mutex;
 
 use viahop::{
     Board, DsnDesign, RouteReport, RouteScore, RouterConfig, parse_ses,
-    route_board_with_checkpoint, ses, signal,
+    route_board_with_checkpoint, ses, signal, validate_reroute_nets,
 };
 
 struct CliArgs {
@@ -181,6 +181,9 @@ fn parse_args(args: &[String]) -> Result<Action, String> {
 
     let input_dsn = input_dsn.ok_or("missing required input DSN (-de <INPUT.dsn>)")?;
     let output_ses = output_ses.ok_or("missing required output SES (-do <OUTPUT.ses>)")?;
+    if reroute_pad_mm.is_some() && reroute_nets.is_none() {
+        return Err("--reroute-pad-mm requires --reroute-nets".to_string());
+    }
 
     Ok(Action::Run(Box::new(CliArgs {
         input_dsn,
@@ -215,6 +218,9 @@ fn run(cli: CliArgs) -> Result<(), String> {
     }
 
     let board = Board::from_dsn(&design, &cli.ignored_nets, cli.via_at_smd)?;
+    if let Some(ref targets) = cli.reroute_nets {
+        validate_reroute_nets(&board, targets)?;
+    }
     let initial_routes = if let Some(ref ses_path) = cli.initial_session {
         let ses_text = fs::read_to_string(ses_path)
             .map_err(|e| format!("failed to read initial session {ses_path}: {e}"))?;

@@ -60,19 +60,54 @@ pub(crate) fn check_drc_scoped(
         via_grid.insert(i, bb);
     }
 
-    let max_board_clr = board
+    let max_seg_expand = board
         .nets
         .iter()
         .map(|n| n.rules.clearance)
-        .fold(0.0_f64, f64::max);
-    let max_board_vclr = board
+        .fold(0.0_f64, f64::max)
+        + 50.0;
+    let max_via_expand = board
         .nets
         .iter()
         .map(|n| n.rules.via_via.max(n.rules.via_wire))
-        .fold(220.0_f64, f64::max);
+        .fold(220.0_f64, f64::max)
+        + 50.0;
 
     let mut buf = Vec::new();
     let mut static_buf = Vec::new();
+
+    let check_via_seg = |report: &mut DrcReport,
+                         via_net: usize,
+                         via: &RoutedVia,
+                         seg_net: usize,
+                         seg: &RoutedSegment| {
+        if !via.layers.contains(&seg.layer) {
+            return;
+        }
+        let req = board.via_to_wire_clearance(via_net, Some(seg_net));
+        let sh = Shape::Circle {
+            center: via.pos,
+            radius: via.radius,
+        };
+        let gap = sh.dist_to_capsule(seg.a, seg.b, seg.width * 0.5);
+        if gap < req - 0.5 {
+            if is_target(via_net) {
+                report.conflicting_nets.insert(via_net);
+            }
+            if is_target(seg_net) {
+                report.conflicting_nets.insert(seg_net);
+            }
+            report.violations.push(DrcViolation {
+                net_a: via_net,
+                net_b: Some(seg_net),
+                layer: Some(seg.layer),
+                pos: via.pos,
+                kind: "via_seg",
+                gap_um: gap,
+                required_um: req,
+            });
+        }
+    };
 
     // 1. Check routed segments against static obstacles, other routed segments, and non-target vias.
     for (idx, &(net_a, seg, bb)) in all_segs.iter().enumerate() {
@@ -101,8 +136,7 @@ pub(crate) fn check_drc_scoped(
             });
         }
 
-        let max_clr = board.nets[net_a].rules.clearance.max(max_board_clr) + 50.0;
-        seg_grid.query(bb.expand(max_clr), &mut buf);
+        seg_grid.query(bb.expand(max_seg_expand), &mut buf);
         for &j in &buf {
             let (net_b, seg_b, _) = all_segs[j];
             let b_target = is_target(net_b);
@@ -134,30 +168,11 @@ pub(crate) fn check_drc_scoped(
         }
 
         if target_mask.is_some() {
-            let max_vw = board.nets[net_a].rules.via_wire.max(max_board_vclr) + 50.0;
-            via_grid.query(bb.expand(max_vw), &mut buf);
+            via_grid.query(bb.expand(max_via_expand), &mut buf);
             for &j in &buf {
                 let (net_b, via_b, _) = all_vias[j];
-                if is_target(net_b) || net_a == net_b || !via_b.layers.contains(&seg.layer) {
-                    continue;
-                }
-                let req = board.via_to_wire_clearance(net_b, Some(net_a));
-                let sh = Shape::Circle {
-                    center: via_b.pos,
-                    radius: via_b.radius,
-                };
-                let gap = sh.dist_to_capsule(seg.a, seg.b, half_w);
-                if gap < req - 0.5 {
-                    report.conflicting_nets.insert(net_a);
-                    report.violations.push(DrcViolation {
-                        net_a: net_b,
-                        net_b: Some(net_a),
-                        layer: Some(seg.layer),
-                        pos: via_b.pos,
-                        kind: "via_seg",
-                        gap_um: gap,
-                        required_um: req,
-                    });
+                if !is_target(net_b) {
+                    check_via_seg(&mut report, net_b, via_b, net_a, seg);
                 }
             }
         }
@@ -181,13 +196,7 @@ pub(crate) fn check_drc_scoped(
             });
         }
 
-        let max_vclr = board.nets[net_a]
-            .rules
-            .via_via
-            .max(board.nets[net_a].rules.via_wire)
-            .max(max_board_vclr)
-            + 50.0;
-        via_grid.query(bb.expand(max_vclr), &mut buf);
+        via_grid.query(bb.expand(max_via_expand), &mut buf);
         for &j in &buf {
             let (net_b, via_b, _) = all_vias[j];
             let b_target = is_target(net_b);
@@ -233,32 +242,11 @@ pub(crate) fn check_drc_scoped(
             }
         }
 
-        seg_grid.query(bb.expand(max_vclr), &mut buf);
+        seg_grid.query(bb.expand(max_via_expand), &mut buf);
         for &j in &buf {
             let (net_b, seg_b, _) = all_segs[j];
-            if net_a == net_b || !via.layers.contains(&seg_b.layer) {
-                continue;
-            }
-            let req = board.via_to_wire_clearance(net_a, Some(net_b));
-            let sh = Shape::Circle {
-                center: via.pos,
-                radius: via.radius,
-            };
-            let gap = sh.dist_to_capsule(seg_b.a, seg_b.b, seg_b.width * 0.5);
-            if gap < req - 0.5 {
-                report.conflicting_nets.insert(net_a);
-                if is_target(net_b) {
-                    report.conflicting_nets.insert(net_b);
-                }
-                report.violations.push(DrcViolation {
-                    net_a,
-                    net_b: Some(net_b),
-                    layer: Some(seg_b.layer),
-                    pos: via.pos,
-                    kind: "via_seg",
-                    gap_um: gap,
-                    required_um: req,
-                });
+            if net_a != net_b {
+                check_via_seg(&mut report, net_a, via, net_b, seg_b);
             }
         }
     }

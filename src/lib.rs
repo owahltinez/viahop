@@ -21,7 +21,9 @@ pub use connectivity::RouteScore;
 pub use drc::{DrcReport, DrcViolation, check_drc};
 pub use dsn::DsnDesign;
 pub use report::{RouteReport, UnroutedConnection, UnroutedKind, ViolationDetail};
-pub use router::{RouteStats, RouterConfig, route_board, route_board_with_checkpoint};
+pub use router::{
+    RouteStats, RouterConfig, route_board, route_board_with_checkpoint, validate_reroute_nets,
+};
 pub use ses::parse_ses;
 
 /// Complete result of routing a parsed Specctra DSN design.
@@ -58,6 +60,9 @@ impl RouteStats {
 /// Resolves `design` into a physical board and routes all non-ignored nets.
 pub fn route(design: &DsnDesign, config: &RouterConfig) -> Result<RouteResult, String> {
     let board = Board::from_dsn(design, &config.ignored_nets, config.via_at_smd)?;
+    if let Some(ref targets) = config.reroute_nets {
+        router::validate_reroute_nets(&board, targets)?;
+    }
     let inner = router::route_board(&board, config);
     Ok(RouteResult {
         board,
@@ -77,6 +82,9 @@ where
     F: Fn(&Board, &[NetRoute], RouteScore) + Sync,
 {
     let board = Board::from_dsn(design, &config.ignored_nets, config.via_at_smd)?;
+    if let Some(ref targets) = config.reroute_nets {
+        router::validate_reroute_nets(&board, targets)?;
+    }
     let hook = |routes: &[NetRoute], score: RouteScore| on_best(&board, routes, score);
     let inner = router::route_board_with_checkpoint(&board, config, Some(&hook));
     Ok(RouteResult {

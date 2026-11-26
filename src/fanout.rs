@@ -127,6 +127,25 @@ pub fn analyze_fanout(board: &Board) -> FanoutPlan {
     plan
 }
 
+pub(crate) fn dogbone_candidates(center: Point, pitch: f64) -> [Point; 8] {
+    let offset = if pitch.is_finite() && pitch > 100.0 {
+        pitch * 0.5
+    } else {
+        350.0
+    };
+    [
+        (1.0, 1.0),
+        (-1.0, 1.0),
+        (1.0, -1.0),
+        (-1.0, -1.0),
+        (1.0, 0.0),
+        (-1.0, 0.0),
+        (0.0, 1.0),
+        (0.0, -1.0),
+    ]
+    .map(|(dx, dy)| Point::new(center.x + dx * offset, center.y + dy * offset))
+}
+
 fn find_dogbone_via(
     board: &Board,
     pad: &Pad,
@@ -136,36 +155,18 @@ fn find_dogbone_via(
     sbuf: &mut Vec<usize>,
 ) -> Option<Point> {
     let rules = &board.nets[net_id].rules;
-    let offset = if pitch.is_finite() && pitch > 100.0 {
-        pitch * 0.5
-    } else {
-        350.0
-    };
-    let dirs = [
-        (1.0, 1.0),
-        (-1.0, 1.0),
-        (1.0, -1.0),
-        (-1.0, -1.0),
-        (1.0, 0.0),
-        (-1.0, 0.0),
-        (0.0, 1.0),
-        (0.0, -1.0),
-    ];
-    for (dx, dy) in dirs {
-        let cand = Point::new(pad.center.x + dx * offset, pad.center.y + dy * offset);
-        if board.check_via_static_with_buf(net_id, cand, 0.0, sbuf)
-            && board.check_segment_static_with_buf(
-                net_id,
-                layer,
-                pad.center,
-                cand,
-                rules.width,
-                0.0,
-                sbuf,
-            )
-        {
-            return Some(cand);
-        }
-    }
-    None
+    dogbone_candidates(pad.center, pitch)
+        .into_iter()
+        .find(|&cand| {
+            board.check_via_static_with_buf(net_id, cand, 0.0, sbuf)
+                && board.check_segment_static_with_buf(
+                    net_id,
+                    layer,
+                    pad.center,
+                    cand,
+                    rules.width,
+                    0.0,
+                    sbuf,
+                )
+        })
 }
