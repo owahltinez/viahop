@@ -126,7 +126,10 @@ pub fn format_atom(s: &str) -> String {
     }
     let needs_quote = s.bytes().any(|b| {
         b.is_ascii_whitespace()
-            || matches!(b, b'(' | b')' | b'"' | b'[' | b']' | b':' | b';' | b'#')
+            || matches!(
+                b,
+                b'(' | b')' | b'"' | b'\\' | b'[' | b']' | b':' | b';' | b'#'
+            )
     });
     if !needs_quote {
         return s.to_string();
@@ -134,7 +137,7 @@ pub fn format_atom(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for ch in s.chars() {
-        if ch == '"' {
+        if ch == '\\' || ch == '"' {
             out.push('\\');
         }
         out.push(ch);
@@ -265,10 +268,10 @@ impl<'a> Parser<'a> {
         while self.pos < self.bytes.len() {
             let b = self.bytes[self.pos];
             if b == b'\\'
-                && self.pos + 1 < self.bytes.len()
-                && self.bytes[self.pos + 1] == self.quote
+                && let Some(&next) = self.bytes.get(self.pos + 1)
+                && (next == b'\\' || next == self.quote)
             {
-                buf.push(self.quote);
+                buf.push(next);
                 self.pos += 2;
             } else if b == self.quote {
                 self.pos += 1;
@@ -318,5 +321,85 @@ mod tests {
     #[test]
     fn rejects_unclosed_paren() {
         assert!(parse("(pcb (structure)").is_err());
+    }
+
+    #[test]
+    fn parses_quoted_ending_with_escaped_backslash() {
+        let expr = parse(r#"(pcb "C:\\proj\\")"#).unwrap();
+        assert_eq!(expr.as_list().unwrap()[1].as_atom(), Some(r"C:\proj\"));
+
+        let with_sibling = parse(r#"(pcb "C:\\proj\\" (net foo))"#).unwrap();
+        assert_eq!(
+            with_sibling.as_list().unwrap()[1].as_atom(),
+            Some(r"C:\proj\")
+        );
+        let net = with_sibling.find_child("net").unwrap();
+        assert_eq!(net.as_list().unwrap()[1].as_atom(), Some("foo"));
+    }
+
+    #[test]
+    fn parses_escaped_backslash_before_escaped_quote() {
+        let expr = parse(r#"(a "foo\\\"bar")"#).unwrap();
+        assert_eq!(expr.as_list().unwrap()[1].as_atom(), Some(r#"foo\"bar"#));
+
+        let just_pair = parse(r#"(a "\\\"")"#).unwrap();
+        assert_eq!(just_pair.as_list().unwrap()[1].as_atom(), Some(r#"\""#));
+    }
+
+    #[test]
+    fn parses_multiple_consecutive_backslashes() {
+        assert_eq!(parse(r#""\\""#).unwrap().as_atom(), Some(r"\"));
+        assert_eq!(parse(r#""\\\\""#).unwrap().as_atom(), Some(r"\\"));
+        assert_eq!(parse(r#""\\\\\\""#).unwrap().as_atom(), Some(r"\\\"));
+        assert_eq!(parse(r#""a\\b\\c""#).unwrap().as_atom(), Some(r"a\b\c"));
+    }
+
+    #[test]
+    fn preserves_non_escape_backslashes() {
+        assert_eq!(parse(r#""a\b""#).unwrap().as_atom(), Some(r"a\b"));
+        let expr = parse(r#"(pcb "C:\temp\board.dsn")"#).unwrap();
+        assert_eq!(
+            expr.as_list().unwrap()[1].as_atom(),
+            Some(r"C:\temp\board.dsn")
+        );
+    }
+
+    #[test]
+    fn rejects_unterminated_quoted_with_trailing_escape() {
+        assert!(parse(r#"(pcb "C:\\proj\\\")"#).is_err());
+        assert!(parse(r#"(pcb "abc\"#).is_err());
+    }
+
+    #[test]
+    fn parses_escaped_backslash_with_custom_string_quote() {
+        let src = r"(pcb 'C:\\proj\\' (parser (string_quote ')) (a 'foo\\\'bar'))";
+        let expr = parse(src).unwrap();
+        assert_eq!(expr.as_list().unwrap()[1].as_atom(), Some(r"C:\proj\"));
+        let a = expr.find_child("a").unwrap();
+        assert_eq!(a.as_list().unwrap()[1].as_atom(), Some(r"foo\'bar"));
+    }
+
+    #[test]
+    fn round_trips_display_with_backslashes_and_quotes() {
+        assert_eq!(format_atom(r"C:\proj\"), r#""C:\\proj\\""#);
+        assert_eq!(format_atom(r#"foo\"bar"#), r#""foo\\\"bar""#);
+
+        let samples = [
+            r"C:\proj\",
+            r#"foo\"bar"#,
+            r"\\",
+            r"\",
+            r"a\b\c",
+            r"a b\\c",
+            r"C:\temp",
+            r#"a"b\c\"#,
+            "",
+        ];
+        for s in samples {
+            let expr = SExp::List(vec![SExp::Atom("item".into()), SExp::Atom(s.into())]);
+            let rendered = expr.to_string();
+            let parsed = parse(&rendered).unwrap_or_else(|e| panic!("failed on {rendered}: {e}"));
+            assert_eq!(parsed, expr, "round-trip mismatch for {s:?} -> {rendered}");
+        }
     }
 }
